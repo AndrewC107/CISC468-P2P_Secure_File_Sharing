@@ -13,3 +13,7 @@ TCP_BUFFER_SIZE = 4096          # Max bytes read in a single recv() call
 
 # A peer is considered gone if not heard from within this window
 PEER_TIMEOUT = 30               # Seconds
+
+# File storage – relative to wherever main.py is launched (project root)
+SHARED_DIR    = "storage/shared"     # Files this peer is willing to share
+DOWNLOADS_DIR = "storage/downloads"  # Files received from other peers

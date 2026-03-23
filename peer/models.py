@@ -9,33 +9,43 @@ from typing import Any
 
 
 @dataclass
-class Peer:
-    """
-    Represents a single node in the P2P network.
-
-    Each peer is uniquely identified by peer_id, and reachable at host:port.
-    last_seen is updated whenever we hear from this peer (via discovery or message).
-    """
-    peer_id: str        # UUID string – stable for the lifetime of the process
-    host: str           # IP address (e.g. "192.168.1.5")
-    port: int           # TCP port the peer's server is listening on
-    name: str           # Human-readable display name (e.g. "Alice")
-    last_seen: float = field(default_factory=time.time)  # Unix timestamp
-
-
-@dataclass
 class Message:
     """
     A single message exchanged between two peers over TCP.
 
-    msg_type  – what kind of message this is (see MessageType in protocol.py)
-    sender_id – peer_id of the originating peer
-    payload   – arbitrary key/value data; content depends on msg_type
-    timestamp – when the message was created (Unix timestamp)
-    msg_id    – unique ID so messages can be deduplicated if needed later
+    Fields are kept flat and JSON-serialisable so a future Java (or any other)
+    client can parse them without custom deserializers.
+
+    type        – what kind of message this is (see MessageType in protocol.py)
+    sender_id   – UUID of the originating peer
+    sender_name – human-readable display name of the sender
+    sender_port – TCP port the sender's server is listening on
+    payload     – arbitrary key/value data; content depends on type
+    msg_id      – unique ID for deduplication
+    timestamp   – Unix timestamp (seconds) when the message was created
     """
-    msg_type: str
+    type: str
     sender_id: str
+    sender_name: str
+    sender_port: int
     payload: dict[str, Any]
+    msg_id: str   = field(default_factory=lambda: str(uuid.uuid4()))
     timestamp: float = field(default_factory=time.time)
-    msg_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+@dataclass
+class PeerInfo:
+    """
+    Represents a discovered peer on the network.
+
+    peer_id   – stable UUID for the lifetime of the remote process
+    peer_name – human-readable display name (e.g. "Alice")
+    ip        – IP address of the peer
+    port      – TCP port the peer's server is listening on
+    last_seen – Unix timestamp of the last discovery announcement
+    """
+    peer_id: str
+    peer_name: str
+    ip: str
+    port: int
+    last_seen: float = field(default_factory=time.time)

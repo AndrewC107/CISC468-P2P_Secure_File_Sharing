@@ -1,5 +1,10 @@
 # ──────────────────────────────────────────────────────────────────────
 # protocol.py – JSON wire format for all messages exchanged between peers
+#
+# Framing: newline-delimited JSON (NDJSON) over TCP.
+#   - Each message is a single JSON object followed by '\n'.
+#   - Splitting a byte stream into messages is trivially done by splitting
+#     on '\n', and is easy to replicate in any language (Java, Go, etc.).
 # ──────────────────────────────────────────────────────────────────────
 
 import json
@@ -9,36 +14,88 @@ from peer.models import Message
 
 
 # ── Message type constants ──────────────────────────────────────────────
-# Using a plain class of string constants keeps things simple and readable.
-# These values are what travels in the "msg_type" field on the wire.
+# Plain class of string constants – readable in logs and identical in any
+# language that implements this protocol.
 
 class MessageType:
-    HELLO      = "hello"       # Greeting when a peer connects / says hi
-    CHAT       = "chat"        # Plain text chat message
-    BYE        = "bye"         # Polite disconnect notification
-    FILE_OFFER = "file_offer"  # (Future) notify a peer that a file is available
+    HELLO               = "hello"               # Initial greeting / peer announcement
+    HELLO_ACK           = "hello_ack"           # Acknowledgement sent in reply to HELLO
+    CHAT                = "chat"                # Plain text chat message
+    BYE                 = "bye"                 # Polite disconnect notification
+    FILE_OFFER          = "file_offer"          # Notify a peer that a file is available
+    FILE_LIST_REQUEST   = "file_list_request"   # Ask a peer for their shared file list
+    FILE_LIST_RESPONSE  = "file_list_response"  # Reply carrying the list of filenames
+    FILE_REQUEST        = "file_request"        # Ask a peer to send a specific file
+    FILE_TRANSFER       = "file_transfer"       # Carry file data (base64-encoded) to receiver
+    FILE_REJECTED       = "file_rejected"       # Sender declined the file request
 
 
-# ── Encoding ────────────────────────────────────────────────────────────
+# ── Required fields (validated on every inbound message) ───────────────
+_REQUIRED_FIELDS: tuple[str, ...] = (
+    "type", "sender_id", "sender_name", "sender_port", "payload"
+)
+
+
+# ── Validation ──────────────────────────────────────────────────────────
+
+def validate_message(data: dict) -> None:
+    """
+    Check that all required fields are present and have the right types.
+
+    Raises ValueError listing every missing field, making it easy to log
+    or surface a clear error when a malformed message arrives.
+    """
+    missing = [f for f in _REQUIRED_FIELDS if f not in data]
+    if missing:
+        raise ValueError(f"Message is missing required fields: {missing}")
+
+    if not isinstance(data["sender_port"], int):
+        raise ValueError("sender_port must be an integer")
+
+    if not isinstance(data["payload"], dict):
+        raise ValueError("payload must be a JSON object (dict)")
+
+
+# ── Serialization ────────────────────────────────────────────────────────
+
+def message_to_json(message: Message) -> str:
+    """
+    Serialize a Message dataclass to a newline-terminated JSON string.
+
+    The trailing '\\n' is the NDJSON frame delimiter.  On the receiving end,
+    split the incoming byte stream on '\\n' to recover individual messages –
+    this pattern works identically in Python, Java, or any other language.
+
+    Example output (one line, truncated):
+        {"type": "hello", "sender_id": "...", ...}\\n
+    """
+    return json.dumps(asdict(message)) + "\n"
+
+
+# ── Deserialization ──────────────────────────────────────────────────────
+
+def json_to_message(raw: str) -> Message:
+    """
+    Parse a JSON string (with or without a trailing newline) into a Message.
+
+    Raises:
+        json.JSONDecodeError – if raw is not valid JSON
+        ValueError           – if required fields are missing or have wrong types
+    """
+    data = json.loads(raw.strip())   # strip() removes the frame-delimiter newline
+    validate_message(data)
+    return Message(**data)
+
+
+# ── Byte-level helpers (convenience wrappers for TCP send/recv) ──────────
+# These wrap the string API so the rest of the codebase (server, client)
+# can work directly with bytes without calling encode/decode manually.
 
 def encode_message(message: Message) -> bytes:
-    """
-    Serialize a Message dataclass to UTF-8 encoded JSON bytes.
+    """Encode a Message to UTF-8 bytes ready to be written to a TCP socket."""
+    return message_to_json(message).encode("utf-8")
 
-    This is what gets sent over the TCP socket.
-    """
-    data = asdict(message)           # Convert dataclass → plain dict
-    return json.dumps(data).encode("utf-8")
-
-
-# ── Decoding ────────────────────────────────────────────────────────────
 
 def decode_message(raw: bytes) -> Message:
-    """
-    Deserialize UTF-8 encoded JSON bytes back into a Message dataclass.
-
-    Raises json.JSONDecodeError if the bytes are not valid JSON.
-    Raises TypeError if required fields are missing.
-    """
-    data = json.loads(raw.decode("utf-8"))  # bytes → dict
-    return Message(**data)                  # dict → dataclass
+    """Decode UTF-8 bytes received from a TCP socket into a Message."""
+    return json_to_message(raw.decode("utf-8"))
