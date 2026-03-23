@@ -1,0 +1,6 @@
+# P2P Secure Share - Phase 1
+# All functionality in this phase uses the Python standard library only.
+# No third-party packages are required yet.
+
+# Testing
+pytest>=7.4
