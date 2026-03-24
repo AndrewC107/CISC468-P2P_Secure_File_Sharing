@@ -18,6 +18,9 @@ env/
 .vscode/
 .idea/
 
+# Java (Maven)
+java-client/target/
+
 # Identity keys – NEVER commit private keys to git
 identity/
 
