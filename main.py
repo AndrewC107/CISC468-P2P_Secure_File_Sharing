@@ -44,14 +44,21 @@ import logging
 import queue
 import threading
 
+from peer import contacts as contact_store
 from peer.client import PeerClient
 from peer.config import DEFAULT_TCP_PORT, DOWNLOADS_DIR, SHARED_DIR
+from peer.crypto import format_fingerprint_for_display, load_or_generate_keys
 from peer.discovery import PeerDiscovery
 from peer.files import ensure_storage_dirs, list_shared_files
 from peer.models import Message, PeerInfo
 from peer.protocol import MessageType
 from peer.server import PeerServer, PendingConsentRequest
 from peer.utils import generate_peer_id, get_local_ip
+
+# ── Note on key deletion ───────────────────────────────────────────────────────
+# If you want to test fresh key generation, delete the identity/ folder.
+# Contacts that stored old keys will need to be refreshed via IDENTITY_EXCHANGE.
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Keep background thread logger.info() calls silent; print() handles UI output.
 logging.basicConfig(level=logging.WARNING, format="[%(levelname)s] %(message)s")
@@ -139,7 +146,13 @@ def print_menu() -> None:
     print("  3  –  Send HELLO to a peer")
     print("  4  –  Request file list from a peer")
     print("  5  –  Request a file from a peer")
-    print("  6  –  Exit")
+    print("  ─" * 21)
+    print("  6  –  Exchange identity with a peer")
+    print("  7  –  Show my fingerprint")
+    print("  8  –  Show contacts")
+    print("  9  –  Trust a contact")
+    print("  ─" * 21)
+    print("  0  –  Exit")
     print("─" * 44)
 
 
@@ -244,6 +257,114 @@ def action_request_file(
     client.request_file(peer.ip, peer.port, filename)
 
 
+def action_exchange_identity(
+    discovery: PeerDiscovery, client: PeerClient
+) -> None:
+    """
+    Menu 6 – send IDENTITY_EXCHANGE to a chosen peer.
+
+    This initiates the mutual authentication handshake:
+      • We send our Ed25519 signing key, X25519 encryption key, and fingerprint.
+      • The peer replies with their own (IDENTITY_ACK).
+      • Both sides save each other in their contact store.
+      • After exchange, encrypted file transfer becomes available with that peer.
+
+    After the exchange, use 'Trust a contact' (menu 9) to mark the peer
+    as verified once you have compared fingerprints out-of-band.
+    """
+    peer = pick_peer(discovery)
+    if peer is not None:
+        client.send_identity_exchange(peer.ip, peer.port)
+
+
+def action_show_my_fingerprint(local_peer: PeerInfo) -> None:
+    """
+    Menu 7 – display this peer's public-key fingerprint.
+
+    The fingerprint is the SHA-256 hash of the public key encoded as
+    colon-separated hex pairs.  Share this string with another person so they
+    can confirm they are connected to YOU and not an impostor.
+
+    How to use out-of-band verification:
+      1. Call or message the other person through a channel you already trust.
+      2. Read your fingerprint aloud (or paste it).
+      3. They compare it to the fingerprint saved under your name in their
+         contacts list.  If they match, you are verified.
+    """
+    if local_peer.fingerprint is None:
+        print("  Identity keys not loaded – restart the app.")
+        return
+    print()
+    print("  My public-key fingerprint (SHA-256):")
+    print(format_fingerprint_for_display(local_peer.fingerprint))
+    print()
+    print("  Share this fingerprint with other peers so they can verify")
+    print("  your identity out-of-band (phone call, in person, etc.).")
+
+
+def action_show_contacts() -> None:
+    """
+    Menu 8 – list all saved contacts with their trust status.
+
+    Contacts are added automatically whenever IDENTITY_EXCHANGE is received.
+    Use 'Trust a contact' (menu 9) to mark a contact as verified.
+    """
+    contacts = contact_store.list_contacts()
+    if not contacts:
+        print("  No contacts yet.")
+        print("  Use 'Exchange identity' (menu 6) to populate this list.")
+        return
+    print(f"  {len(contacts)} contact(s):")
+    for i, c in enumerate(contacts, start=1):
+        trust_label = "✓ trusted" if c.get("trusted") else "  unverified"
+        print(f"  {i:2}.  [{trust_label}]  {c['peer_name']:15}  {c['peer_id'][:8]}…")
+        print(f"         Fingerprint: {c['fingerprint']}")
+
+
+def action_trust_contact() -> None:
+    """
+    Menu 9 – mark a contact as trusted after out-of-band fingerprint verification.
+
+    Workflow:
+      1. The user compares the displayed fingerprint to the one they received
+         through a separate, already-trusted channel (phone call, etc.).
+      2. If they match, the user marks the contact as trusted here.
+      3. Trusted contacts are flagged in contacts.json and can be used in a
+         future phase to enable signature verification on incoming messages.
+    """
+    contacts = contact_store.list_contacts()
+    unverified = [c for c in contacts if not c.get("trusted")]
+    if not unverified:
+        print("  No unverified contacts to trust.")
+        return
+
+    print(f"  {len(unverified)} unverified contact(s):")
+    for i, c in enumerate(unverified, start=1):
+        print(f"  {i:2}.  {c['peer_name']:15}  {c['peer_id'][:8]}…")
+        print(f"         Fingerprint: {c['fingerprint']}")
+
+    choice = input("  Enter contact number to trust (or Enter to cancel): ").strip()
+    if not choice.isdigit() or not (1 <= int(choice) <= len(unverified)):
+        print("  Cancelled.")
+        return
+
+    target = unverified[int(choice) - 1]
+    print()
+    print(f"  You are about to trust:  {target['peer_name']}")
+    print(f"  Fingerprint:")
+    print(format_fingerprint_for_display(target["fingerprint"]))
+    print()
+    print("  Confirm that this fingerprint matches what you received out-of-band")
+    print("  (e.g. over a phone call or in person).")
+    confirm = input("  Mark as trusted? (y/n): ").strip().lower()
+
+    if confirm == "y":
+        contact_store.set_trusted(target["peer_id"], trusted=True)
+        print(f"  ✓ {target['peer_name']} is now marked as trusted.")
+    else:
+        print("  Trust not granted.")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,6 +373,11 @@ def main() -> None:
     # ── 1. Startup ───────────────────────────────────────────────────────────
     ensure_storage_dirs()   # create storage/shared/ and storage/downloads/
 
+    # Load (or generate on first run) both the Ed25519 signing key pair and
+    # the X25519 encryption key pair.  Private keys stay on disk in identity/.
+    # Public keys and the fingerprint are shared via IDENTITY_EXCHANGE.
+    identity = load_or_generate_keys()
+
     name, port = prompt_startup()
 
     local_peer = PeerInfo(
@@ -259,12 +385,17 @@ def main() -> None:
         peer_name=name,
         ip=get_local_ip(),
         port=port,
+        public_key=identity.signing_public_key_pem,
+        encryption_key=identity.encryption_public_key_pem,
+        fingerprint=identity.fingerprint,
     )
-    print(f"\n  Name     : {local_peer.peer_name}")
-    print(f"  ID       : {local_peer.peer_id}")
-    print(f"  Addr     : {local_peer.ip}:{local_peer.port}")
-    print(f"  Shared   : {SHARED_DIR}/")
-    print(f"  Downloads: {DOWNLOADS_DIR}/")
+    print(f"\n  Name       : {local_peer.peer_name}")
+    print(f"  ID         : {local_peer.peer_id}")
+    print(f"  Addr       : {local_peer.ip}:{local_peer.port}")
+    print(f"  Shared     : {SHARED_DIR}/")
+    print(f"  Downloads  : {DOWNLOADS_DIR}/")
+    print(f"  Signing key (Ed25519) fingerprint:")
+    print(format_fingerprint_for_display(identity.fingerprint))
 
     # ── 2. Create the shared consent queue and service objects ────────────────
     #
@@ -278,9 +409,14 @@ def main() -> None:
         port=port,
         local_peer=local_peer,
         consent_queue=consent_queue,
+        signing_private_key=identity.signing_private_key,
+        encryption_private_key=identity.encryption_private_key,
     )
     discovery = PeerDiscovery(local_peer=local_peer)
-    client    = PeerClient(local_peer=local_peer)
+    client    = PeerClient(
+        local_peer=local_peer,
+        encryption_private_key=identity.encryption_private_key,
+    )
 
     # ── 3. Define callbacks as closures (capture discovery + client) ──────────
 
@@ -349,10 +485,18 @@ def main() -> None:
             elif choice == "5":
                 action_request_file(discovery, client)
             elif choice == "6":
+                action_exchange_identity(discovery, client)
+            elif choice == "7":
+                action_show_my_fingerprint(local_peer)
+            elif choice == "8":
+                action_show_contacts()
+            elif choice == "9":
+                action_trust_contact()
+            elif choice == "0":
                 print("  Goodbye!")
                 break
             else:
-                print("  Please enter 1–6.")
+                print("  Please enter 0–9.")
 
     except KeyboardInterrupt:
         print("\n  Interrupted.")

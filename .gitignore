@@ -17,3 +17,9 @@ env/
 # IDE
 .vscode/
 .idea/
+
+# Identity keys – NEVER commit private keys to git
+identity/
+
+# Contact store – local data, not shared via git
+contacts/

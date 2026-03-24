@@ -1,6 +1,11 @@
-# P2P Secure Share - Phase 1
-# All functionality in this phase uses the Python standard library only.
-# No third-party packages are required yet.
+# P2P Secure Share - Phase 2
+# Phase 2 adds identity keys and contact authentication.
+
+# Cryptography – Ed25519 key generation, PEM serialisation, SHA-256 fingerprints
+# Used by peer/crypto.py for all key operations.
+# Keys are stored in PKCS#8 / SubjectPublicKeyInfo PEM formats so a future
+# Java client can parse them with java.security.KeyFactory.getInstance("Ed25519").
+cryptography>=42.0
 
 # Testing
 pytest>=7.4

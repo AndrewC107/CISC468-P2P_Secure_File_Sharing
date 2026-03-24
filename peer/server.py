@@ -13,6 +13,7 @@
 #   anything else      → forwarded to on_message callback only
 # ────────────────────────────────────────────────────────────────────────────
 
+import base64
 import json
 import logging
 import queue
@@ -20,6 +21,12 @@ import socket
 import threading
 from typing import Callable
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+from peer import contacts as contact_store
+from peer import crypto
 from peer.files import list_shared_files, read_shared_file_b64, save_downloaded_file
 from peer.models import Message, PeerInfo
 from peer.protocol import MessageType, decode_message, encode_message
@@ -142,20 +149,26 @@ class PeerServer:
         local_peer: PeerInfo,
         consent_queue: queue.Queue | None = None,
         on_message: Callable[[Message, tuple[str, int]], None] | None = None,
+        signing_private_key:    Ed25519PrivateKey | None = None,
+        encryption_private_key: X25519PrivateKey  | None = None,
     ) -> None:
         """
-        host          – bind address; "0.0.0.0" listens on all interfaces
-        port          – TCP port to listen on
-        local_peer    – this node's identity (used to build response messages)
-        consent_queue – thread-safe queue for pending FILE_REQUEST consents
-        on_message    – optional callback(message, addr) fired for every message
+        host                   – bind address; "0.0.0.0" listens on all interfaces
+        port                   – TCP port to listen on
+        local_peer             – this node's identity (used to build response messages)
+        consent_queue          – thread-safe queue for pending FILE_REQUEST consents
+        on_message             – optional callback(message, addr) fired for every message
+        signing_private_key    – Ed25519 key for signing outgoing FILE_TRANSFER messages
+        encryption_private_key – X25519 key for decrypting unsolicited incoming FILE_TRANSFER
         """
-        self.host          = host
-        self.port          = port
-        self.local_peer    = local_peer
-        self.consent_queue = consent_queue
-        self.on_message    = on_message
-        self._running      = False
+        self.host                   = host
+        self.port                   = port
+        self.local_peer             = local_peer
+        self.consent_queue          = consent_queue
+        self.on_message             = on_message
+        self._signing_private_key    = signing_private_key
+        self._encryption_private_key = encryption_private_key
+        self._running               = False
         self._server_socket: socket.socket | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -259,6 +272,11 @@ class PeerServer:
             return None
         elif message.type == MessageType.FILE_REJECTED:
             return None
+        elif message.type == MessageType.IDENTITY_EXCHANGE:
+            return self._handle_identity_exchange(message)
+        elif message.type == MessageType.IDENTITY_ACK:
+            # The client already processes the ACK payload; nothing to do here.
+            return None
         else:
             logger.debug(f"No built-in handler for '{message.type}'")
             return None
@@ -289,21 +307,52 @@ class PeerServer:
         self, message: Message, addr: tuple[str, int]
     ) -> Message:
         """
-        FILE_REQUEST – hand off to the main CLI thread via the consent queue.
+        FILE_REQUEST – ask the user for consent, then encrypt and send the file.
 
-        This method NEVER calls input().  Instead:
-          1. It creates a PendingConsentRequest and puts it in consent_queue.
-          2. It prints a brief notification so the user knows to press Enter.
-          3. It blocks on req.wait_for_decision() until the main loop resolves it.
-          4. Based on the decision, it reads the file and returns the response.
-
-        The connection socket stays open while we wait, which is why the
-        client uses a 30-second timeout and we use 25 seconds here.
+        Encrypted transfer flow
+        ───────────────────────
+        1. Look up the requester's X25519 encryption key in the contact store.
+           If not found, reject with a clear reason – identity exchange is required
+           before encrypted file transfer.
+        2. Ask the user for consent via the consent queue (never calls input() here).
+        3. On acceptance:
+           a. Generate a fresh ephemeral X25519 key pair. [PERFECT FORWARD SECRECY]
+           b. Derive an AES-256 session key via ECDH + HKDF-SHA256.  [CONFIDENTIALITY]
+           c. Encrypt the file bytes with AES-256-GCM.  [CONFIDENTIALITY + INTEGRITY]
+           d. Sign (filename + ephemeral key + nonce + ciphertext) with Ed25519.  [AUTHENTICATION]
+           e. Return a FILE_TRANSFER message with all encrypted fields.
         """
-        filename = message.payload.get("filename", "")
+        filename  = message.payload.get("filename", "")
+        sender_id = message.sender_id
+
+        # ── Require identity exchange before encrypted transfer ────────────────
+        contact = contact_store.get_contact(sender_id)
+        if not contact or not contact.get("encryption_key"):
+            reason = (
+                "encrypted transfer requires identity exchange – "
+                "ask the requester to use menu option 6 (Exchange identity) first"
+            )
+            logger.warning(f"FILE_REQUEST from {sender_id} rejected: no encryption key in contacts")
+            return Message(
+                type=MessageType.FILE_REJECTED,
+                sender_id=self.local_peer.peer_id,
+                sender_name=self.local_peer.peer_name,
+                sender_port=self.local_peer.port,
+                payload={"filename": filename, "reason": reason},
+            )
+
+        if self._signing_private_key is None:
+            reason = "server has no signing key configured – restart the application"
+            logger.error("FILE_REQUEST received but signing_private_key is not set")
+            return Message(
+                type=MessageType.FILE_REJECTED,
+                sender_id=self.local_peer.peer_id,
+                sender_name=self.local_peer.peer_name,
+                sender_port=self.local_peer.port,
+                payload={"filename": filename, "reason": reason},
+            )
 
         if self.consent_queue is None:
-            # No consent mechanism configured – auto-decline gracefully
             logger.warning("FILE_REQUEST received but consent_queue is not set; auto-declining")
             return Message(
                 type=MessageType.FILE_REJECTED,
@@ -313,51 +362,23 @@ class PeerServer:
                 payload={"filename": filename, "reason": "server not configured for file transfer"},
             )
 
-        # Build the consent request that the main thread will resolve
+        # ── Get user consent ───────────────────────────────────────────────────
         req = PendingConsentRequest(
             peer_name=message.sender_name,
-            peer_id=message.sender_id,
+            peer_id=sender_id,
             peer_ip=addr[0],
             peer_port=message.sender_port,
             filename=filename,
         )
-
-        # Alert the user with a plain print() – no input() here.
-        # This notification may appear mid-menu because it's on a background
-        # thread, but it does NOT steal keyboard input from the main thread.
         print(
             f"\n  ⚑  [{self.local_peer.peer_name}]"
             f" {message.sender_name} wants to receive '{filename}'\n"
             f"     Press Enter at the menu to accept or decline.\n"
         )
-
-        # Enqueue and block until the main loop provides a decision
         self.consent_queue.put(req)
         accepted = req.wait_for_decision(timeout=25.0)
 
-        # ── Build the response ─────────────────────────────────────────────────
-        if accepted:
-            b64_data = read_shared_file_b64(filename)
-            if b64_data is None:
-                print(
-                    f"  ✗ [{self.local_peer.peer_name}]"
-                    f" File '{filename}' not found in storage/shared/"
-                )
-                return Message(
-                    type=MessageType.FILE_REJECTED,
-                    sender_id=self.local_peer.peer_id,
-                    sender_name=self.local_peer.peer_name,
-                    sender_port=self.local_peer.port,
-                    payload={"filename": filename, "reason": "file not found"},
-                )
-            return Message(
-                type=MessageType.FILE_TRANSFER,
-                sender_id=self.local_peer.peer_id,
-                sender_name=self.local_peer.peer_name,
-                sender_port=self.local_peer.port,
-                payload={"filename": filename, "data": b64_data},
-            )
-        else:
+        if not accepted:
             return Message(
                 type=MessageType.FILE_REJECTED,
                 sender_id=self.local_peer.peer_id,
@@ -366,15 +387,215 @@ class PeerServer:
                 payload={"filename": filename, "reason": "declined by user"},
             )
 
-    def _handle_file_transfer(self, message: Message) -> None:
-        """FILE_TRANSFER (unsolicited push) – decode and save the file."""
-        filename = message.payload.get("filename", "received_file")
-        b64_data = message.payload.get("data", "")
+        # ── Read the file ──────────────────────────────────────────────────────
+        from pathlib import Path
+        from peer.config import SHARED_DIR
+        file_path = Path(SHARED_DIR) / filename
+        if not file_path.exists() or not file_path.is_file():
+            print(f"  ✗ [{self.local_peer.peer_name}] File '{filename}' not found in storage/shared/")
+            return Message(
+                type=MessageType.FILE_REJECTED,
+                sender_id=self.local_peer.peer_id,
+                sender_name=self.local_peer.peer_name,
+                sender_port=self.local_peer.port,
+                payload={"filename": filename, "reason": "file not found"},
+            )
+        plaintext = file_path.read_bytes()
+
+        # ── Encrypt the file ───────────────────────────────────────────────────
         try:
-            saved_path = save_downloaded_file(filename, b64_data)
-            print(f"\n  ✓ File received: '{filename}' saved to {saved_path}")
+            # [PFS] Generate a fresh ephemeral X25519 key pair for this transfer only.
+            ephemeral_key = crypto.generate_ephemeral_x25519()
+            eph_pub_raw   = crypto.x25519_public_key_to_raw(ephemeral_key)
+
+            # [CONFIDENTIALITY] Derive AES session key via ECDH + HKDF-SHA256.
+            receiver_raw_pub = crypto.x25519_public_raw_from_pem(contact["encryption_key"])
+            aes_key          = crypto.ecdh_derive_key(ephemeral_key, receiver_raw_pub)
+
+            # [CONFIDENTIALITY + INTEGRITY] Encrypt with AES-256-GCM.
+            nonce, ciphertext = crypto.aes_gcm_encrypt(aes_key, plaintext)
+
+            # [AUTHENTICATION] Sign transfer metadata with our Ed25519 key.
+            signature = crypto.sign_transfer(
+                self._signing_private_key, filename, eph_pub_raw, nonce, ciphertext
+            )
+
         except Exception as exc:
+            logger.error(f"Encryption failed for '{filename}': {exc}")
+            print(f"  ✗ [{self.local_peer.peer_name}] Encryption failed for '{filename}': {exc}")
+            return Message(
+                type=MessageType.FILE_REJECTED,
+                sender_id=self.local_peer.peer_id,
+                sender_name=self.local_peer.peer_name,
+                sender_port=self.local_peer.port,
+                payload={"filename": filename, "reason": "encryption error"},
+            )
+
+        print(f"  🔒 [{self.local_peer.peer_name}] Sending '{filename}' encrypted to {message.sender_name}")
+
+        return Message(
+            type=MessageType.FILE_TRANSFER,
+            sender_id=self.local_peer.peer_id,
+            sender_name=self.local_peer.peer_name,
+            sender_port=self.local_peer.port,
+            payload={
+                "filename":             filename,
+                "encrypted":            True,
+                "ephemeral_public_key": base64.b64encode(eph_pub_raw).decode("ascii"),
+                "nonce":                base64.b64encode(nonce).decode("ascii"),
+                "ciphertext":           base64.b64encode(ciphertext).decode("ascii"),
+                "signature":            base64.b64encode(signature).decode("ascii"),
+                "original_size":        len(plaintext),
+            },
+        )
+
+    def _handle_file_transfer(self, message: Message) -> None:
+        """
+        FILE_TRANSFER (unsolicited push from a remote peer) – decrypt and save.
+
+        Handles both encrypted (Phase 2+) and legacy plaintext transfers.
+        For encrypted transfers, verifies the Ed25519 signature BEFORE
+        attempting decryption.
+        """
+        filename  = message.payload.get("filename", "received_file")
+        encrypted = message.payload.get("encrypted", False)
+
+        if encrypted:
+            self._receive_encrypted_file(message)
+        else:
+            # Legacy plaintext path (no encryption_key exchange needed)
+            b64_data = message.payload.get("data", "")
+            try:
+                saved_path = save_downloaded_file(filename, b64_data)
+                print(f"\n  ✓ File received: '{filename}' saved to {saved_path}")
+            except Exception as exc:
+                print(f"  ✗ Failed to save '{filename}': {exc}")
+
+    def _receive_encrypted_file(self, message: Message) -> None:
+        """
+        Decrypt and verify an encrypted FILE_TRANSFER pushed to this server.
+
+        Uses self._encryption_private_key (the local peer's long-term X25519 key)
+        together with the sender's ephemeral public key to reconstruct the
+        AES session key.  The sender's Ed25519 public key is looked up in
+        the contact store for signature verification.
+
+        Security errors (bad signature, failed decryption) are logged and
+        displayed but never silently ignored.
+        """
+        filename  = message.payload.get("filename", "received_file")
+        sender_id = message.sender_id
+
+        if self._encryption_private_key is None:
+            print(f"  ✗ Cannot decrypt '{filename}' – no encryption key configured.")
+            return
+
+        # ── Decode all base64 fields ───────────────────────────────────────────
+        try:
+            eph_pub_raw  = base64.b64decode(message.payload["ephemeral_public_key"])
+            nonce        = base64.b64decode(message.payload["nonce"])
+            ciphertext   = base64.b64decode(message.payload["ciphertext"])
+            signature    = base64.b64decode(message.payload["signature"])
+        except (KeyError, Exception) as exc:
+            print(f"  ✗ Malformed encrypted FILE_TRANSFER from {message.sender_name}: {exc}")
+            return
+
+        # ── [AUTHENTICATION] Verify signature before touching the ciphertext ──
+        contact = contact_store.get_contact(sender_id)
+        if not contact or not contact.get("public_key"):
+            print(
+                f"  ✗ SECURITY: Cannot verify '{filename}' from {message.sender_name}"
+                f" – no signing key in contacts.  Exchange identities first."
+            )
+            return
+
+        sig_ok = crypto.verify_transfer_signature(
+            contact["public_key"], filename, eph_pub_raw, nonce, ciphertext, signature
+        )
+        if not sig_ok:
+            print(
+                f"\n  ✗ SECURITY WARNING: Signature verification FAILED for '{filename}'"
+                f" from {message.sender_name}.\n"
+                f"     The file may have been tampered with or sent by an impostor.\n"
+                f"     File discarded.\n"
+            )
+            return
+
+        # ── [CONFIDENTIALITY] Decrypt with AES-256-GCM ────────────────────────
+        try:
+            aes_key   = crypto.ecdh_derive_key(self._encryption_private_key, eph_pub_raw)
+            plaintext = crypto.aes_gcm_decrypt(aes_key, nonce, ciphertext)
+        except InvalidTag:
+            print(
+                f"\n  ✗ SECURITY WARNING: Integrity check FAILED for '{filename}'"
+                f" from {message.sender_name}.\n"
+                f"     The ciphertext authentication tag is invalid – data was corrupted"
+                f" or tampered with.\n"
+                f"     File discarded.\n"
+            )
+            return
+        except Exception as exc:
+            print(f"  ✗ Decryption error for '{filename}': {exc}")
+            return
+
+        # ── Save the decrypted file ────────────────────────────────────────────
+        try:
+            from pathlib import Path
+            from peer.config import DOWNLOADS_DIR
+            from peer.files import ensure_storage_dirs
+            ensure_storage_dirs()
+            dest = Path(DOWNLOADS_DIR) / filename
+            dest.write_bytes(plaintext)
+            print(
+                f"\n  ✓ 🔓 File received and decrypted: '{filename}' saved to {dest}"
+                f"  ({len(plaintext):,} bytes, signature verified)\n"
+            )
+        except OSError as exc:
             print(f"  ✗ Failed to save '{filename}': {exc}")
+
+    def _handle_identity_exchange(self, message: Message) -> Message:
+        """
+        IDENTITY_EXCHANGE – save the sender's identity and reply with ours.
+
+        Saves both the Ed25519 signing key (public_key) and the X25519
+        encryption key (encryption_key) from the payload into the contact store.
+        Both are required before encrypted file transfer can proceed.
+        """
+        payload        = message.payload
+        public_key     = payload.get("public_key", "")
+        encryption_key = payload.get("encryption_key", "")
+        fingerprint    = payload.get("fingerprint", "")
+
+        if public_key and fingerprint:
+            contact_store.save_contact(
+                peer_id=message.sender_id,
+                peer_name=message.sender_name,
+                public_key=public_key,
+                fingerprint=fingerprint,
+                trusted=False,
+                encryption_key=encryption_key or None,
+            )
+            print(
+                f"\n  ⚿  [{self.local_peer.peer_name}]"
+                f" Identity received from {message.sender_name}"
+                f" – saved to contacts (unverified)\n"
+                f"     Fingerprint: {fingerprint}\n"
+            )
+
+        # Reply with both our Ed25519 and X25519 public keys
+        return Message(
+            type=MessageType.IDENTITY_ACK,
+            sender_id=self.local_peer.peer_id,
+            sender_name=self.local_peer.peer_name,
+            sender_port=self.local_peer.port,
+            payload={
+                "peer_id":        self.local_peer.peer_id,
+                "peer_name":      self.local_peer.peer_name,
+                "public_key":     self.local_peer.public_key     or "",
+                "encryption_key": self.local_peer.encryption_key or "",
+                "fingerprint":    self.local_peer.fingerprint    or "",
+            },
+        )
 
     # ── Terminal output ───────────────────────────────────────────────────────
 
@@ -411,6 +632,16 @@ class PeerServer:
             filename = message.payload.get("filename", "?")
             reason   = message.payload.get("reason", "declined")
             print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: '{filename}' – {reason}")
+
+        elif message.type == MessageType.IDENTITY_EXCHANGE:
+            fp = message.payload.get("fingerprint", "?")
+            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender} – sending ACK")
+            print(f"     Their fingerprint: {fp}")
+
+        elif message.type == MessageType.IDENTITY_ACK:
+            fp = message.payload.get("fingerprint", "?")
+            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}")
+            print(f"     Their fingerprint: {fp}")
 
         else:
             print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: {message.payload}")

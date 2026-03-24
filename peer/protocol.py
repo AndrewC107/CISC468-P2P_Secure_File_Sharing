@@ -29,6 +29,23 @@ class MessageType:
     FILE_TRANSFER       = "file_transfer"       # Carry file data (base64-encoded) to receiver
     FILE_REJECTED       = "file_rejected"       # Sender declined the file request
 
+    # ── Identity / authentication messages (Phase 2) ──────────────────────────
+    # These messages form the foundation for mutual authentication:
+    #   1. Either peer initiates IDENTITY_EXCHANGE, sending their public key.
+    #   2. The recipient saves the key, verifies the fingerprint, and replies
+    #      with IDENTITY_ACK carrying their own public key.
+    #   3. Both peers now have each other's keys stored locally.
+    #   4. A future phase adds signatures to every message so each peer can
+    #      cryptographically verify that a message was sent by the expected peer.
+    #
+    # Payload fields (both directions):
+    #   peer_id     – sender's stable UUID
+    #   peer_name   – sender's display name
+    #   public_key  – PEM-encoded Ed25519 public key (SubjectPublicKeyInfo format)
+    #   fingerprint – SHA-256 fingerprint string for out-of-band comparison
+    IDENTITY_EXCHANGE   = "identity_exchange"   # Send our public key to a peer
+    IDENTITY_ACK        = "identity_ack"        # Acknowledge and send our own key back
+
 
 # ── Required fields (validated on every inbound message) ───────────────
 _REQUIRED_FIELDS: tuple[str, ...] = (
