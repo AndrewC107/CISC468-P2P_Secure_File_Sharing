@@ -54,33 +54,49 @@ def save_contact(
     """
     Save or update a contact in the store.
 
-    If a record with this peer_id already exists it is updated in place so
-    that a peer can change their display name without creating duplicates.
-    Otherwise a new entry is appended.
+    Match priority:
+      1. peer_id  – exact match (fast path, same session)
+      2. fingerprint – if a contact with the same long-term key fingerprint
+         already exists under a *different* peer_id (because the peer
+         restarted and got a fresh session UUID), update that entry and
+         refresh the peer_id to the latest value.  This prevents a new
+         duplicate contact from being created on every restart.
 
     trusted defaults to False – the user must call set_trusted() explicitly
     after verifying the fingerprint out-of-band.
 
     encryption_key is the X25519 SubjectPublicKeyInfo PEM for this peer.
-    It is needed to derive the AES session key when sending them a file.
     If not provided (None), an existing value in the store is preserved.
     """
     data: dict[str, Any] = _load_all()
     contacts: list[dict] = data.setdefault("contacts", [])
 
+    def _update_entry(entry: dict) -> None:
+        entry["peer_id"]    = peer_id          # refresh in case of restart
+        entry["peer_name"]  = peer_name
+        entry["public_key"] = public_key
+        entry["fingerprint"] = fingerprint
+        if encryption_key is not None:
+            entry["encryption_key"] = encryption_key
+        if not entry.get("trusted", False):
+            entry["trusted"] = trusted
+
+    # ── 1. Match by peer_id ───────────────────────────────────────────────────
     for entry in contacts:
         if entry.get("peer_id") == peer_id:
-            entry["peer_name"]   = peer_name
-            entry["public_key"]  = public_key
-            entry["fingerprint"] = fingerprint
-            if encryption_key is not None:
-                entry["encryption_key"] = encryption_key
-            # Never downgrade an already-trusted contact automatically
-            if not entry.get("trusted", False):
-                entry["trusted"] = trusted
+            _update_entry(entry)
             _save_all(data)
             return
 
+    # ── 2. Match by fingerprint (peer restarted → new peer_id, same keys) ─────
+    if fingerprint:
+        for entry in contacts:
+            if entry.get("fingerprint") == fingerprint:
+                _update_entry(entry)
+                _save_all(data)
+                return
+
+    # ── 3. Truly new contact ───────────────────────────────────────────────────
     contacts.append({
         "peer_id":        peer_id,
         "peer_name":      peer_name,
@@ -103,6 +119,50 @@ def get_contact(peer_id: str) -> dict | None:
 def list_contacts() -> list[dict]:
     """Return all saved contact dicts (may be empty)."""
     return _load_all().get("contacts", [])
+
+
+def get_contact_by_fingerprint(fingerprint: str) -> dict | None:
+    """
+    Find a contact by their Ed25519 public key fingerprint.
+
+    Used during key rotation verification: the KEY_ROTATION message carries
+    the old fingerprint so the receiver can look up the contact and retrieve
+    the old public key for signature verification before updating the record.
+
+    Returns the contact dict, or None if no matching entry exists.
+    """
+    for entry in _load_all().get("contacts", []):
+        if entry.get("fingerprint") == fingerprint:
+            return entry
+    return None
+
+
+def update_contact_keys(
+    peer_id:            str,
+    new_public_key:     str,
+    new_encryption_key: str,
+    new_fingerprint:    str,
+) -> bool:
+    """
+    Replace a contact's cryptographic keys after a verified key rotation.
+
+    Only the key fields are updated; peer_id, peer_name, and trusted status
+    are preserved so re-authentication steps are not accidentally lost.
+
+    Returns True if the contact was found and updated, False otherwise.
+
+    Requirement 6: "Existing contacts should be notified, and any necessary
+    steps should be taken to re-establish authenticated and secure communication."
+    """
+    data = _load_all()
+    for entry in data.get("contacts", []):
+        if entry.get("peer_id") == peer_id:
+            entry["public_key"]     = new_public_key
+            entry["encryption_key"] = new_encryption_key
+            entry["fingerprint"]    = new_fingerprint
+            _save_all(data)
+            return True
+    return False
 
 
 def set_trusted(peer_id: str, trusted: bool = True) -> bool:

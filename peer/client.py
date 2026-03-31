@@ -3,28 +3,37 @@
 #
 # Public API summary
 # ──────────────────
-#   send_message(ip, port, msg)           – fire-and-forget; no response read
-#   send_hello(ip, port)                  – HELLO → HELLO_ACK; returns ACK msg
-#   request_file_list(ip, port)           – FILE_LIST_REQUEST → list of dicts
-#   request_file(ip, port, filename)      – FILE_REQUEST → saves downloaded file
+#   send_message(ip, port, msg)                         – fire-and-forget
+#   send_hello(ip, port)                                – HELLO → HELLO_ACK
+#   request_file_list(ip, port)                         – FILE_LIST_REQUEST
+#   request_file(ip, port, filename, …)                 – FILE_REQUEST (+ fallback)
+#   send_identity_exchange(ip, port)                    – IDENTITY_EXCHANGE
+#   send_key_rotation(ip, port, old_identity, new_identity) – KEY_ROTATION
 # ────────────────────────────────────────────────────────────────────────────
 
+from __future__ import annotations
+
 import base64
+import hashlib
 import json
 import logging
 import socket
-from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
+from peer import catalog
 from peer import contacts as contact_store
 from peer import crypto
-from peer.config import DOWNLOADS_DIR
-from peer.files import ensure_storage_dirs, save_downloaded_file
+from peer.files import save_downloaded_file, save_downloaded_file_secure
 from peer.models import Message, PeerInfo
 from peer.protocol import MessageType, decode_message, encode_message
 from peer.utils import recv_line
+
+if TYPE_CHECKING:
+    from peer.crypto import LocalIdentity
+    from peer.storage import StorageKey
 
 logger = logging.getLogger(__name__)
 
@@ -40,25 +49,37 @@ class PeerClient:
     """
     Connects to remote peers and sends NDJSON messages over TCP.
 
-    Constructor
-    -----------
-    local_peer – this node's PeerInfo, used to fill sender fields in messages
-
-    Public methods
-    --------------
-    send_message(ip, port, message)   -> bool
-    send_hello(ip, port)              -> Message | None   (HELLO_ACK)
-    request_file_list(ip, port)       -> list[dict] | None
-    request_file(ip, port, filename)  -> bool
+    Constructor arguments
+    ─────────────────────
+    local_peer             – this node's PeerInfo, used to fill sender fields
+    encryption_private_key – X25519 key for decrypting incoming FILE_TRANSFER
+    storage_key            – AES key for encrypting downloaded files at rest (Req 9)
     """
 
     def __init__(
         self,
         local_peer:             PeerInfo,
         encryption_private_key: X25519PrivateKey | None = None,
+        storage_key:            "StorageKey | None" = None,
     ) -> None:
         self.local_peer              = local_peer
         self._encryption_private_key = encryption_private_key
+        self._storage_key            = storage_key
+        # Set to True by _send_and_recv when a connection error occurs (not a
+        # protocol-level rejection).  Used by request_file() to decide whether
+        # to try alternate sources.
+        self._last_conn_failed       = False
+
+    # ── Key rotation support (Requirement 6) ──────────────────────────────────
+
+    def update_identity(self, new_identity: "LocalIdentity") -> None:
+        """
+        Hot-swap the client's encryption key after a key rotation.
+
+        Called by main.py immediately after rotate_keys() so new incoming
+        FILE_TRANSFER messages can be decrypted with the new X25519 key.
+        """
+        self._encryption_private_key = new_identity.encryption_private_key
 
     # ── Low-level helpers ─────────────────────────────────────────────────────
 
@@ -74,11 +95,7 @@ class PeerClient:
                 sock.sendall(encode_message(message))
                 logger.info(f"Sent '{message.type}' to {peer_ip}:{peer_port}")
                 return True
-        except ConnectionRefusedError:
-            logger.error(f"Connection refused by {peer_ip}:{peer_port}")
-        except TimeoutError:
-            logger.error(f"Connection to {peer_ip}:{peer_port} timed out")
-        except OSError as exc:
+        except (ConnectionRefusedError, TimeoutError, OSError) as exc:
             logger.error(f"Error sending to {peer_ip}:{peer_port} – {exc}")
         return False
 
@@ -92,12 +109,14 @@ class PeerClient:
         """
         Send one message and read back exactly one NDJSON response.
 
-        The `timeout` parameter lets callers use a longer wait for operations
-        that require human interaction on the remote side (e.g. FILE_REQUEST,
-        where the remote user must type y/n before we get a response).
+        Sets self._last_conn_failed = True when the failure is a network
+        connection error (peer offline) vs. a protocol error.  Callers that
+        need to distinguish the two cases (e.g. request_file fallback) can
+        inspect this flag after a None return.
 
         Returns the parsed response Message, or None on any error.
         """
+        self._last_conn_failed = False
         try:
             with socket.create_connection(
                 (peer_ip, peer_port), timeout=timeout
@@ -109,22 +128,26 @@ class PeerClient:
                     return None
                 return decode_message(raw)
         except ConnectionRefusedError:
-            print(f"  ✗ Connection refused by {peer_ip}:{peer_port}")
+            self._last_conn_failed = True
+            print(f"  ✗ Connection refused by {peer_ip}:{peer_port} (peer may be offline)")
             logger.error(f"Connection refused by {peer_ip}:{peer_port}")
         except TimeoutError:
-            print(f"  ✗ Connection to {peer_ip}:{peer_port} timed out")
+            self._last_conn_failed = True
+            print(f"  ✗ Connection to {peer_ip}:{peer_port} timed out (peer may be offline)")
             logger.error(f"Connection to {peer_ip}:{peer_port} timed out")
+        except OSError as exc:
+            self._last_conn_failed = True
+            print(f"  ✗ Network error reaching {peer_ip}:{peer_port} – {exc}")
+            logger.error(f"OSError communicating with {peer_ip}:{peer_port} – {exc}")
         except json.JSONDecodeError as exc:
             print(f"  ✗ Malformed response from {peer_ip}:{peer_port} – {exc}")
             logger.error(f"Malformed JSON from {peer_ip}:{peer_port}: {exc}")
         except ValueError as exc:
             print(f"  ✗ Invalid response from {peer_ip}:{peer_port} – {exc}")
             logger.error(f"Invalid response from {peer_ip}:{peer_port}: {exc}")
-        except OSError as exc:
-            logger.error(f"Error communicating with {peer_ip}:{peer_port} – {exc}")
         return None
 
-    # ── High-level helpers ────────────────────────────────────────────────────
+    # ── High-level methods ────────────────────────────────────────────────────
 
     def send_hello(self, peer_ip: str, peer_port: int) -> Message | None:
         """
@@ -154,11 +177,11 @@ class PeerClient:
         """
         Ask the remote peer for their shared file list.
 
-        Sends FILE_LIST_REQUEST and returns a list of file-info dicts on success:
-            [{"filename": "photo.jpg", "size": 204800}, ...]
+        Now includes sha256 fields when the remote peer supports them
+        (Requirement 5).  The caller should update the catalog after this
+        call so offline fallback can use the hash data.
 
-        Returns None if the request failed or the peer sent an unexpected type.
-        An empty list is valid – the peer simply has nothing shared.
+        Returns a list of file-info dicts, or None on failure.
         """
         request = Message(
             type=MessageType.FILE_LIST_REQUEST,
@@ -186,29 +209,42 @@ class PeerClient:
         if files:
             print(f"  ✓ [{self.local_peer.peer_name}] {len(files)} file(s) shared by {response.sender_name}:")
             for i, f in enumerate(files, start=1):
-                name = f.get("filename", "?")
-                size = f.get("size", 0)
-                print(f"      {i}.  {name}  ({_fmt_size(size)})")
+                name   = f.get("filename", "?")
+                size   = f.get("size", 0)
+                sha256 = f.get("sha256", "")
+                hash_part = f"  sha256:{sha256[:12]}…" if sha256 else ""
+                print(f"      {i}.  {name}  ({_fmt_size(size)}){hash_part}")
         else:
             print(f"  ✓ [{self.local_peer.peer_name}] {response.sender_name} has no shared files.")
         return files
 
     def request_file(
-        self, peer_ip: str, peer_port: int, filename: str
+        self,
+        peer_ip:          str,
+        peer_port:        int,
+        filename:         str,
+        expected_sha256:  str | None = None,
+        original_peer_id: str | None = None,
+        get_peers:        Callable[[], dict] | None = None,
     ) -> bool:
         """
         Ask the remote peer to send a specific file.
 
-        Sends FILE_REQUEST and waits up to 30 seconds for the peer to
-        accept/reject the request interactively.
+        Waits up to 30 seconds for the peer to accept/reject interactively.
 
-        Encrypted transfer flow (requires prior IDENTITY_EXCHANGE):
-          1. Remote peer encrypts the file with AES-256-GCM under a session key
-             derived from ECDH(their_ephemeral_X25519_priv, our_X25519_pub).
-          2. They sign the transfer with their Ed25519 key.
-          3. We receive the FILE_TRANSFER, verify the signature, decrypt, save.
+        Offline fallback (Requirement 5)
+        ──────────────────────────────────
+        If expected_sha256, original_peer_id, and get_peers are provided AND
+        the connection fails (peer offline), this method:
+          1. Searches the file catalog for alternate peers with the same
+             filename + sha256.
+          2. Prompts the user to confirm the fallback attempt.
+          3. Requests the file from each alternate in turn.
+          4. After decryption, verifies sha256(plaintext) == expected_sha256.
+             If the hash mismatches, the file is discarded and a security
+             warning is shown (Requirement 10).
 
-        Returns True if the file was received and saved, False otherwise.
+        Returns True if the file was received, verified, and saved.
         """
         request = Message(
             type=MessageType.FILE_REQUEST,
@@ -221,19 +257,33 @@ class PeerClient:
             f"  → [{self.local_peer.peer_name}] Requesting '{filename}'"
             f" from {peer_ip}:{peer_port}…"
         )
-        print(f"     (waiting for {peer_ip}:{peer_port} to accept – up to 30 s)")
+        print(f"     (waiting up to 30 s for the peer to accept)")
 
         response = self._send_and_recv(
             peer_ip, peer_port, request, timeout=_FILE_TRANSFER_TIMEOUT
         )
+
         if response is None:
+            if self._last_conn_failed and expected_sha256 and original_peer_id and get_peers:
+                return self._try_alternate_sources(
+                    filename, expected_sha256, original_peer_id, get_peers
+                )
             return False
 
+        return self._process_file_transfer_response(response, filename, expected_sha256)
+
+    def _process_file_transfer_response(
+        self,
+        response:        Message,
+        filename:        str,
+        expected_sha256: str | None = None,
+    ) -> bool:
+        """Process a FILE_TRANSFER or FILE_REJECTED response."""
         if response.type == MessageType.FILE_TRANSFER:
             encrypted = response.payload.get("encrypted", False)
             recv_name = response.payload.get("filename", filename)
             if encrypted:
-                return self._receive_encrypted_file(response, recv_name)
+                return self._receive_encrypted_file(response, recv_name, expected_sha256)
             else:
                 # Legacy plaintext path
                 b64_data = response.payload.get("data", "")
@@ -252,26 +302,102 @@ class PeerClient:
 
         else:
             logger.warning(
-                f"Unexpected response type '{response.type}'"
-                f" from {peer_ip}:{peer_port} for FILE_REQUEST"
+                f"Unexpected response type '{response.type}' for FILE_REQUEST"
             )
             return False
 
-    def _receive_encrypted_file(self, response: Message, filename: str) -> bool:
+    def _try_alternate_sources(
+        self,
+        filename:         str,
+        expected_sha256:  str,
+        original_peer_id: str,
+        get_peers:        Callable[[], dict],
+    ) -> bool:
         """
-        Decrypt and verify an encrypted FILE_TRANSFER received in response to FILE_REQUEST.
+        Try to download a file from alternate peers when the primary is offline.
 
-        Security checks (both must pass before the file is saved):
-          1. [AUTHENTICATION] Verify the sender's Ed25519 signature using their
-             public key from the contact store.
+        Requirement 5: "If peer A is offline but peer B already had peer A's
+        file list, peer B may find another peer C that had previously downloaded
+        the file from peer A and request the file from them instead."
+
+        Integrity is enforced by comparing sha256(plaintext) to the hash
+        originally advertised by the offline peer.
+        """
+        peers_dict = get_peers()  # {peer_id: PeerInfo}
+        known_ids  = list(peers_dict.keys())
+
+        candidates = catalog.find_alternate_peers(
+            filename, expected_sha256, original_peer_id, known_ids
+        )
+
+        if not candidates:
+            print(
+                f"  ✗ No alternate sources found for '{filename}'.\n"
+                f"     No other known peer has advertised this file with the same hash."
+            )
+            return False
+
+        peer_names = [
+            peers_dict[pid].peer_name
+            for pid in candidates
+            if pid in peers_dict
+        ]
+        print(
+            f"\n  ↻  Primary peer is offline.  Alternate source(s) found:\n"
+            f"     {', '.join(peer_names)}\n"
+            f"     The downloaded file will be verified against the original hash."
+        )
+        confirm = input("  Try alternate source? (y/n): ").strip().lower()
+        if confirm != "y":
+            print("  Fallback cancelled.")
+            return False
+
+        for alt_peer_id in candidates:
+            alt_peer = peers_dict.get(alt_peer_id)
+            if alt_peer is None:
+                continue
+
+            print(f"\n  → Trying alternate source: {alt_peer.peer_name} @ {alt_peer.ip}:{alt_peer.port}")
+            request = Message(
+                type=MessageType.FILE_REQUEST,
+                sender_id=self.local_peer.peer_id,
+                sender_name=self.local_peer.peer_name,
+                sender_port=self.local_peer.port,
+                payload={"filename": filename},
+            )
+            print(f"     (waiting up to 30 s for {alt_peer.peer_name} to accept)")
+            response = self._send_and_recv(
+                alt_peer.ip, alt_peer.port, request, timeout=_FILE_TRANSFER_TIMEOUT
+            )
+            if response is None:
+                continue  # that alternate is also unreachable – try next
+
+            success = self._process_file_transfer_response(
+                response, filename, expected_sha256
+            )
+            if success:
+                return True
+            # If the transfer itself was rejected or hash-failed, try next alternate.
+
+        print(f"  ✗ All alternate sources failed for '{filename}'.")
+        return False
+
+    def _receive_encrypted_file(
+        self,
+        response:        Message,
+        filename:        str,
+        expected_sha256: str | None = None,
+    ) -> bool:
+        """
+        Decrypt and verify an encrypted FILE_TRANSFER.
+
+        Security checks:
+          1. [AUTHENTICATION] Verify Ed25519 signature using contact's stored key.
           2. [CONFIDENTIALITY + INTEGRITY] Decrypt with AES-256-GCM.
-             The GCM authentication tag detects any ciphertext tampering.
+          3. [INTEGRITY – alternate source] Compare sha256(plaintext) to the hash
+             originally advertised by the intended peer (Requirement 5).
 
-        The session key is derived from:
-          ECDH(our_X25519_private_key, sender_ephemeral_X25519_public) + HKDF-SHA256
-        This is the ECDH-symmetric counterpart of what the sender computed.
-
-        Returns True if the file was successfully verified, decrypted, and saved.
+        Returns True only if all checks pass and the file is saved.
         """
         sender_id = response.sender_id
 
@@ -321,8 +447,7 @@ class PeerClient:
             print(
                 f"\n  ✗ SECURITY WARNING: Integrity check FAILED for '{filename}'"
                 f" from {response.sender_name}.\n"
-                f"     The authentication tag is invalid – the ciphertext was corrupted"
-                f" or tampered with.\n"
+                f"     The authentication tag is invalid – data was corrupted or tampered.\n"
                 f"     File discarded – NOT saved.\n"
             )
             return False
@@ -330,15 +455,29 @@ class PeerClient:
             print(f"  ✗ Decryption error for '{filename}': {exc}")
             return False
 
-        # ── Save the plaintext file ────────────────────────────────────────────
+        # ── [INTEGRITY – alternate source] Hash verification (Requirement 5) ──
+        if expected_sha256:
+            actual_sha256 = hashlib.sha256(plaintext).hexdigest()
+            if actual_sha256 != expected_sha256:
+                print(
+                    f"\n  ✗ SECURITY WARNING: Content hash MISMATCH for '{filename}'.\n"
+                    f"     Expected : {expected_sha256}\n"
+                    f"     Received : {actual_sha256}\n"
+                    f"     The file from this alternate source differs from what the"
+                    f" original peer advertised.\n"
+                    f"     File discarded – NOT saved.\n"
+                )
+                return False
+            print(f"  ✓ Content hash verified (matches original peer's advertised hash)")
+
+        # ── Save (encrypted at rest if storage_key is set) ────────────────────
         try:
-            ensure_storage_dirs()
-            dest = Path(DOWNLOADS_DIR) / filename
-            dest.write_bytes(plaintext)
+            dest     = save_downloaded_file_secure(filename, plaintext, self._storage_key)
+            at_rest  = " (encrypted at rest)" if self._storage_key else ""
             orig_size = response.payload.get("original_size", len(plaintext))
             print(
-                f"  ✓ 🔓 '{filename}' decrypted and saved to {dest}"
-                f"  ({orig_size:,} bytes)"
+                f"  ✓ '{filename}' decrypted and saved to {dest}"
+                f"  ({orig_size:,} bytes){at_rest}"
             )
             return True
         except OSError as exc:
@@ -352,15 +491,8 @@ class PeerClient:
         Send our IDENTITY_EXCHANGE to a peer and wait for their IDENTITY_ACK.
 
         Sends both our Ed25519 signing key and X25519 encryption key.
-        Both are required so the remote peer can:
-          • Verify our file-transfer signatures (Ed25519 public key)
-          • Encrypt files they send to us (X25519 public key)
-
-        Mutual authentication flow (client side):
-          1. Build IDENTITY_EXCHANGE with both PEM public keys + fingerprint.
-          2. Send it and wait for IDENTITY_ACK from the remote peer.
-          3. Extract their public_key, encryption_key, fingerprint from the ACK.
-          4. Save both keys in the local contact store (trusted=False).
+        Both are required so the remote peer can verify signatures and encrypt
+        files destined for us.
 
         Returns the IDENTITY_ACK Message, or None if the exchange failed.
         """
@@ -387,7 +519,6 @@ class PeerClient:
             print(f"  ✗ No IDENTITY_ACK received from {peer_ip}:{peer_port}")
             return None
 
-        # Save both of the remote peer's public keys locally
         pub_key        = ack.payload.get("public_key", "")
         encryption_key = ack.payload.get("encryption_key", "")
         fingerprint    = ack.payload.get("fingerprint", "")
@@ -402,16 +533,58 @@ class PeerClient:
                 encryption_key=encryption_key or None,
             )
             enc_status = "with encryption key" if encryption_key else "signing key only"
-            print(f"  ✓ [{self.local_peer.peer_name}] Identity exchanged with {ack.sender_name} ({enc_status})")
+            print(f"  ✓ Identity exchanged with {ack.sender_name} ({enc_status})")
             print(f"     Their fingerprint: {fingerprint}")
             print(f"     Contact saved as unverified – use 'Trust a contact' to verify.")
         else:
-            print(
-                f"  ✓ [{self.local_peer.peer_name}] IDENTITY_ACK from {ack.sender_name}"
-                f" (no public key in response)"
-            )
+            print(f"  ✓ IDENTITY_ACK from {ack.sender_name} (no public key in response)")
 
         return ack
+
+    def send_key_rotation(
+        self,
+        peer_ip:      str,
+        peer_port:    int,
+        old_identity: "LocalIdentity",
+        new_identity: "LocalIdentity",
+    ) -> bool:
+        """
+        Notify a peer that our keys have changed (Requirement 6).
+
+        Builds a KEY_ROTATION message signed with the OLD private key so the
+        receiver can verify the rotation is authorised.  No response is expected
+        (fire-and-forget so the notification is best-effort).
+
+        Parameters
+        ──────────
+        old_identity – identity BEFORE rotation (used to sign the message)
+        new_identity – identity AFTER rotation (new keys to announce)
+
+        Returns True if the message was sent successfully (TCP delivery only;
+        the remote peer may still reject it if verification fails).
+        """
+        signature = crypto.sign_key_rotation(
+            old_identity.signing_private_key,
+            old_identity.fingerprint,
+            new_identity.signing_public_key_pem,
+            new_identity.encryption_public_key_pem,
+            new_identity.fingerprint,
+        )
+
+        message = Message(
+            type=MessageType.KEY_ROTATION,
+            sender_id=self.local_peer.peer_id,
+            sender_name=self.local_peer.peer_name,
+            sender_port=self.local_peer.port,
+            payload={
+                "old_fingerprint":    old_identity.fingerprint,
+                "new_public_key":     new_identity.signing_public_key_pem,
+                "new_encryption_key": new_identity.encryption_public_key_pem,
+                "new_fingerprint":    new_identity.fingerprint,
+                "signature":          base64.b64encode(signature).decode("ascii"),
+            },
+        )
+        return self.send_message(peer_ip, peer_port, message)
 
 
 # ── Formatting helper ─────────────────────────────────────────────────────────

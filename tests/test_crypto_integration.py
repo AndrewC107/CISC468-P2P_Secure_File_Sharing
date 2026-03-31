@@ -235,6 +235,14 @@ class TestEd25519SignVerify:
 
 
 class TestContactsWithEncryptionKey:
+    @pytest.fixture(autouse=True)
+    def _isolate_contacts(self, tmp_path, monkeypatch):
+        """Redirect contacts storage to a temp directory so tests never
+        pollute the real contacts/contacts.json file."""
+        import peer.contacts as cs
+        monkeypatch.setattr(cs, "_CONTACTS_DIR",  tmp_path)
+        monkeypatch.setattr(cs, "_CONTACTS_FILE", tmp_path / "contacts.json")
+
     def test_save_and_retrieve_encryption_key(self, alice_identity):
         save_contact(
             peer_id="test-enc-001",
@@ -249,6 +257,14 @@ class TestContactsWithEncryptionKey:
         assert c["encryption_key"] == alice_identity.encryption_public_key_pem
 
     def test_encryption_key_preserved_on_update(self, alice_identity):
+        save_contact(
+            peer_id="test-enc-001",
+            peer_name="TestPeer",
+            public_key=alice_identity.signing_public_key_pem,
+            fingerprint=alice_identity.fingerprint,
+            trusted=False,
+            encryption_key=alice_identity.encryption_public_key_pem,
+        )
         save_contact(
             peer_id="test-enc-001",
             peer_name="UpdatedName",

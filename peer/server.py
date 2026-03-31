@@ -5,13 +5,18 @@
 # ──────────────────────
 #   HELLO              → reply with HELLO_ACK  (symmetric discovery)
 #   HELLO_ACK          → no reply
-#   FILE_LIST_REQUEST  → reply with FILE_LIST_RESPONSE (real file list)
+#   FILE_LIST_REQUEST  → reply with FILE_LIST_RESPONSE (with sha256 hashes)
 #   FILE_LIST_RESPONSE → no reply
 #   FILE_REQUEST       → enqueue PendingConsentRequest, wait for main loop
-#   FILE_TRANSFER      → save received file to storage/downloads/
+#   FILE_TRANSFER      → decrypt and save to storage/downloads/ (encrypted)
 #   FILE_REJECTED      → no reply (client already handles the print)
+#   IDENTITY_EXCHANGE  → save sender's keys, reply with IDENTITY_ACK
+#   IDENTITY_ACK       → no reply (client processes it)
+#   KEY_ROTATION       → verify old-key signature, update contact record
 #   anything else      → forwarded to on_message callback only
 # ────────────────────────────────────────────────────────────────────────────
+
+from __future__ import annotations
 
 import base64
 import json
@@ -19,7 +24,7 @@ import logging
 import queue
 import socket
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -27,10 +32,18 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 from peer import contacts as contact_store
 from peer import crypto
-from peer.files import list_shared_files, read_shared_file_b64, save_downloaded_file
+from peer.files import (
+    list_shared_files,
+    read_shared_file_bytes,
+    save_downloaded_file,
+    save_downloaded_file_secure,
+)
 from peer.models import Message, PeerInfo
 from peer.protocol import MessageType, decode_message, encode_message
 from peer.utils import recv_line
+
+if TYPE_CHECKING:
+    from peer.storage import StorageKey
 
 logger = logging.getLogger(__name__)
 
@@ -147,28 +160,36 @@ class PeerServer:
         host: str,
         port: int,
         local_peer: PeerInfo,
-        consent_queue: queue.Queue | None = None,
+        consent_queue:       queue.Queue | None = None,
+        notification_queue:  queue.Queue | None = None,
         on_message: Callable[[Message, tuple[str, int]], None] | None = None,
         signing_private_key:    Ed25519PrivateKey | None = None,
         encryption_private_key: X25519PrivateKey  | None = None,
+        storage_key:            "StorageKey | None" = None,
     ) -> None:
         """
         host                   – bind address; "0.0.0.0" listens on all interfaces
         port                   – TCP port to listen on
         local_peer             – this node's identity (used to build response messages)
         consent_queue          – thread-safe queue for pending FILE_REQUEST consents
+        notification_queue     – thread-safe queue for background-thread print output;
+                                 the main loop drains this before each menu so messages
+                                 never interleave with "Your choice:" prompts
         on_message             – optional callback(message, addr) fired for every message
         signing_private_key    – Ed25519 key for signing outgoing FILE_TRANSFER messages
         encryption_private_key – X25519 key for decrypting unsolicited incoming FILE_TRANSFER
+        storage_key            – AES key for at-rest encryption of saved files (Req 9)
         """
-        self.host                   = host
-        self.port                   = port
-        self.local_peer             = local_peer
-        self.consent_queue          = consent_queue
-        self.on_message             = on_message
+        self.host                    = host
+        self.port                    = port
+        self.local_peer              = local_peer
+        self.consent_queue           = consent_queue
+        self.notification_queue      = notification_queue
+        self.on_message              = on_message
         self._signing_private_key    = signing_private_key
         self._encryption_private_key = encryption_private_key
-        self._running               = False
+        self._storage_key            = storage_key
+        self._running                = False
         self._server_socket: socket.socket | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -192,6 +213,37 @@ class PeerServer:
         self._running = False
         if self._server_socket:
             self._server_socket.close()
+
+    def _notify(self, message: str) -> None:
+        """
+        Emit a notification string from a background server thread.
+
+        If a notification_queue is configured the string is enqueued so the
+        main CLI thread can print it cleanly between menu iterations (avoiding
+        interleaving with "Your choice:" prompts).
+
+        Falls back to a direct print() when running without a main loop
+        (e.g. in unit tests or standalone use).
+        """
+        if self.notification_queue is not None:
+            self.notification_queue.put(message)
+        else:
+            print(message)
+
+    def update_identity(
+        self,
+        new_signing_key:    Ed25519PrivateKey,
+        new_encryption_key: X25519PrivateKey,
+    ) -> None:
+        """
+        Hot-swap the server's private keys after a key rotation (Requirement 6).
+
+        Called by main.py immediately after rotate_keys() so new FILE_TRANSFER
+        messages are signed/decrypted with the new keys.
+        Thread-safe: the GIL protects simple attribute writes in CPython.
+        """
+        self._signing_private_key    = new_signing_key
+        self._encryption_private_key = new_encryption_key
 
     # ── Accept loop ───────────────────────────────────────────────────────────
 
@@ -229,10 +281,10 @@ class PeerServer:
             try:
                 message = decode_message(raw)
             except json.JSONDecodeError as exc:
-                print(f"  ✗ [{self.local_peer.peer_name}] Bad JSON from {addr[0]}:{addr[1]} – {exc}")
+                self._notify(f"  ✗ [{self.local_peer.peer_name}] Bad JSON from {addr[0]}:{addr[1]} – {exc}")
                 return
             except ValueError as exc:
-                print(f"  ✗ [{self.local_peer.peer_name}] Invalid message from {addr[0]}:{addr[1]} – {exc}")
+                self._notify(f"  ✗ [{self.local_peer.peer_name}] Invalid message from {addr[0]}:{addr[1]} – {exc}")
                 return
 
             # ── Print summary (before dispatch so user sees what arrived) ──────
@@ -277,6 +329,9 @@ class PeerServer:
         elif message.type == MessageType.IDENTITY_ACK:
             # The client already processes the ACK payload; nothing to do here.
             return None
+        elif message.type == MessageType.KEY_ROTATION:
+            self._handle_key_rotation(message)
+            return None
         else:
             logger.debug(f"No built-in handler for '{message.type}'")
             return None
@@ -294,13 +349,19 @@ class PeerServer:
         )
 
     def _handle_file_list_request(self, message: Message) -> Message:
-        """FILE_LIST_REQUEST – reply with real {filename, size} entries."""
+        """
+        FILE_LIST_REQUEST – reply with {filename, size, sha256} entries.
+
+        sha256 is the hash of the plaintext file content so alternate-source
+        integrity verification (Requirement 5) works regardless of where the
+        file is downloaded from.
+        """
         return Message(
             type=MessageType.FILE_LIST_RESPONSE,
             sender_id=self.local_peer.peer_id,
             sender_name=self.local_peer.peer_name,
             sender_port=self.local_peer.port,
-            payload={"files": list_shared_files()},
+            payload={"files": list_shared_files(self._storage_key)},
         )
 
     def _handle_file_request(
@@ -370,10 +431,16 @@ class PeerServer:
             peer_port=message.sender_port,
             filename=filename,
         )
+        # Print the alert directly (bypass the notification queue) so the user
+        # sees it immediately on their terminal even while blocked at the menu
+        # prompt.  This is intentional: the user must know NOW to press Enter.
+        # The actual yes/no dialog is still handled safely by the main thread
+        # via the consent queue; only this one-line alert bypasses the queue.
         print(
             f"\n  ⚑  [{self.local_peer.peer_name}]"
             f" {message.sender_name} wants to receive '{filename}'\n"
-            f"     Press Enter at the menu to accept or decline.\n"
+            f"     Press Enter at the menu to accept or decline.\n",
+            flush=True,
         )
         self.consent_queue.put(req)
         accepted = req.wait_for_decision(timeout=25.0)
@@ -387,12 +454,10 @@ class PeerServer:
                 payload={"filename": filename, "reason": "declined by user"},
             )
 
-        # ── Read the file ──────────────────────────────────────────────────────
-        from pathlib import Path
-        from peer.config import SHARED_DIR
-        file_path = Path(SHARED_DIR) / filename
-        if not file_path.exists() or not file_path.is_file():
-            print(f"  ✗ [{self.local_peer.peer_name}] File '{filename}' not found in storage/shared/")
+        # ── Read the file (transparently decrypting .enc copies) ──────────────
+        plaintext = read_shared_file_bytes(filename, self._storage_key)
+        if plaintext is None:
+            self._notify(f"  ✗ [{self.local_peer.peer_name}] File '{filename}' not found in storage/shared/")
             return Message(
                 type=MessageType.FILE_REJECTED,
                 sender_id=self.local_peer.peer_id,
@@ -400,7 +465,6 @@ class PeerServer:
                 sender_port=self.local_peer.port,
                 payload={"filename": filename, "reason": "file not found"},
             )
-        plaintext = file_path.read_bytes()
 
         # ── Encrypt the file ───────────────────────────────────────────────────
         try:
@@ -422,7 +486,7 @@ class PeerServer:
 
         except Exception as exc:
             logger.error(f"Encryption failed for '{filename}': {exc}")
-            print(f"  ✗ [{self.local_peer.peer_name}] Encryption failed for '{filename}': {exc}")
+            self._notify(f"  ✗ [{self.local_peer.peer_name}] Encryption failed for '{filename}': {exc}")
             return Message(
                 type=MessageType.FILE_REJECTED,
                 sender_id=self.local_peer.peer_id,
@@ -430,8 +494,6 @@ class PeerServer:
                 sender_port=self.local_peer.port,
                 payload={"filename": filename, "reason": "encryption error"},
             )
-
-        print(f"  🔒 [{self.local_peer.peer_name}] Sending '{filename}' encrypted to {message.sender_name}")
 
         return Message(
             type=MessageType.FILE_TRANSFER,
@@ -467,9 +529,9 @@ class PeerServer:
             b64_data = message.payload.get("data", "")
             try:
                 saved_path = save_downloaded_file(filename, b64_data)
-                print(f"\n  ✓ File received: '{filename}' saved to {saved_path}")
+                self._notify(f"\n  ✓ File received: '{filename}' saved to {saved_path}")
             except Exception as exc:
-                print(f"  ✗ Failed to save '{filename}': {exc}")
+                self._notify(f"  ✗ Failed to save '{filename}': {exc}")
 
     def _receive_encrypted_file(self, message: Message) -> None:
         """
@@ -487,7 +549,7 @@ class PeerServer:
         sender_id = message.sender_id
 
         if self._encryption_private_key is None:
-            print(f"  ✗ Cannot decrypt '{filename}' – no encryption key configured.")
+            self._notify(f"  ✗ Cannot decrypt '{filename}' – no encryption key configured.")
             return
 
         # ── Decode all base64 fields ───────────────────────────────────────────
@@ -497,13 +559,13 @@ class PeerServer:
             ciphertext   = base64.b64decode(message.payload["ciphertext"])
             signature    = base64.b64decode(message.payload["signature"])
         except (KeyError, Exception) as exc:
-            print(f"  ✗ Malformed encrypted FILE_TRANSFER from {message.sender_name}: {exc}")
+            self._notify(f"  ✗ Malformed encrypted FILE_TRANSFER from {message.sender_name}: {exc}")
             return
 
         # ── [AUTHENTICATION] Verify signature before touching the ciphertext ──
         contact = contact_store.get_contact(sender_id)
         if not contact or not contact.get("public_key"):
-            print(
+            self._notify(
                 f"  ✗ SECURITY: Cannot verify '{filename}' from {message.sender_name}"
                 f" – no signing key in contacts.  Exchange identities first."
             )
@@ -513,7 +575,7 @@ class PeerServer:
             contact["public_key"], filename, eph_pub_raw, nonce, ciphertext, signature
         )
         if not sig_ok:
-            print(
+            self._notify(
                 f"\n  ✗ SECURITY WARNING: Signature verification FAILED for '{filename}'"
                 f" from {message.sender_name}.\n"
                 f"     The file may have been tampered with or sent by an impostor.\n"
@@ -526,7 +588,7 @@ class PeerServer:
             aes_key   = crypto.ecdh_derive_key(self._encryption_private_key, eph_pub_raw)
             plaintext = crypto.aes_gcm_decrypt(aes_key, nonce, ciphertext)
         except InvalidTag:
-            print(
+            self._notify(
                 f"\n  ✗ SECURITY WARNING: Integrity check FAILED for '{filename}'"
                 f" from {message.sender_name}.\n"
                 f"     The ciphertext authentication tag is invalid – data was corrupted"
@@ -535,23 +597,19 @@ class PeerServer:
             )
             return
         except Exception as exc:
-            print(f"  ✗ Decryption error for '{filename}': {exc}")
+            self._notify(f"  ✗ Decryption error for '{filename}': {exc}")
             return
 
-        # ── Save the decrypted file ────────────────────────────────────────────
+        # ── Save the decrypted file (encrypted at rest if storage_key is set) ─
         try:
-            from pathlib import Path
-            from peer.config import DOWNLOADS_DIR
-            from peer.files import ensure_storage_dirs
-            ensure_storage_dirs()
-            dest = Path(DOWNLOADS_DIR) / filename
-            dest.write_bytes(plaintext)
-            print(
-                f"\n  ✓ 🔓 File received and decrypted: '{filename}' saved to {dest}"
-                f"  ({len(plaintext):,} bytes, signature verified)\n"
+            dest = save_downloaded_file_secure(filename, plaintext, self._storage_key)
+            at_rest = " (encrypted at rest)" if self._storage_key else ""
+            self._notify(
+                f"\n  ✓ File received and decrypted: '{filename}' saved to {dest}"
+                f"  ({len(plaintext):,} bytes, signature verified){at_rest}\n"
             )
         except OSError as exc:
-            print(f"  ✗ Failed to save '{filename}': {exc}")
+            self._notify(f"  ✗ Failed to save '{filename}': {exc}")
 
     def _handle_identity_exchange(self, message: Message) -> Message:
         """
@@ -575,7 +633,7 @@ class PeerServer:
                 trusted=False,
                 encryption_key=encryption_key or None,
             )
-            print(
+            self._notify(
                 f"\n  ⚿  [{self.local_peer.peer_name}]"
                 f" Identity received from {message.sender_name}"
                 f" – saved to contacts (unverified)\n"
@@ -597,51 +655,138 @@ class PeerServer:
             },
         )
 
+    def _handle_key_rotation(self, message: Message) -> None:
+        """
+        KEY_ROTATION – update a contact's keys after they announce a key change.
+
+        Security protocol (Requirement 6):
+          1. Extract old_fingerprint from the payload.
+          2. Look up the contact by their old fingerprint.
+          3. Verify the signature using the OLD public key stored in contacts.
+             This proves the rotation is authorised by the legitimate key holder.
+          4. Only on success: replace the contact's keys with the new ones.
+          5. On failure: print a security warning and discard (Requirement 10).
+
+        After a verified rotation the contact keeps its existing peer_id and
+        trusted status.  A fresh IDENTITY_EXCHANGE is not required because the
+        old-key signature is already proof of authorisation.
+        """
+        payload            = message.payload
+        old_fingerprint    = payload.get("old_fingerprint", "")
+        new_public_key     = payload.get("new_public_key", "")
+        new_encryption_key = payload.get("new_encryption_key", "")
+        new_fingerprint    = payload.get("new_fingerprint", "")
+        b64_sig            = payload.get("signature", "")
+
+        if not all([old_fingerprint, new_public_key, new_fingerprint, b64_sig]):
+            self._notify(f"  ✗ Malformed KEY_ROTATION from {message.sender_name} – missing fields, ignored")
+            return
+
+        # Find the contact by their OLD fingerprint (stable across session restarts).
+        contact = contact_store.get_contact_by_fingerprint(old_fingerprint)
+        if not contact:
+            self._notify(
+                f"  ✗ KEY_ROTATION from {message.sender_name}: no contact with"
+                f" fingerprint {old_fingerprint[:24]}… – ignored"
+            )
+            return
+
+        # Verify the signature using the old public key.
+        try:
+            signature = base64.b64decode(b64_sig)
+        except Exception:
+            self._notify(f"  ✗ KEY_ROTATION from {message.sender_name}: invalid base64 signature – ignored")
+            return
+
+        valid = crypto.verify_key_rotation(
+            contact["public_key"],
+            old_fingerprint,
+            new_public_key,
+            new_encryption_key,
+            new_fingerprint,
+            signature,
+        )
+
+        if not valid:
+            self._notify(
+                f"\n  ✗ SECURITY WARNING: KEY_ROTATION from {message.sender_name} has INVALID signature.\n"
+                f"     This may be a spoofed rotation attempt.  Contact NOT updated.\n"
+            )
+            return
+
+        # Signature is valid – update the stored keys.
+        contact_store.update_contact_keys(
+            contact["peer_id"],
+            new_public_key,
+            new_encryption_key,
+            new_fingerprint,
+        )
+        self._notify(
+            f"\n  ⚿  Key rotation verified for {message.sender_name}.\n"
+            f"     Old fingerprint: {old_fingerprint}\n"
+            f"     New fingerprint: {new_fingerprint}\n"
+            f"     Contact record updated.  Re-verify the new fingerprint out-of-band.\n"
+        )
+
     # ── Terminal output ───────────────────────────────────────────────────────
 
     def _print_received(self, message: Message, addr: tuple[str, int]) -> None:
-        """Print a one-line log of the received message type."""
+        """Queue a one-line log of the received message type for clean display."""
         tag    = message.type.upper()
         sender = f"{message.sender_name} @ {addr[0]}:{addr[1]}"
 
         if message.type == MessageType.HELLO:
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender} – sending ACK")
+            # HELLO/HELLO_ACK are auto-fired by the discovery layer every few
+            # seconds.  Surfacing them as notifications would create constant
+            # noise; the peer table (option 1) already shows this information.
+            pass
 
         elif message.type == MessageType.HELLO_ACK:
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}")
+            pass  # same reason as HELLO above
 
         elif message.type == MessageType.FILE_LIST_REQUEST:
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender} – sending file list")
+            pass  # routine query; user doesn't need an alert each time someone browses their files
 
         elif message.type == MessageType.FILE_LIST_RESPONSE:
             files   = message.payload.get("files", [])
             names   = [f["filename"] if isinstance(f, dict) else str(f) for f in files]
             summary = ", ".join(names) if names else "(empty)"
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: {summary}")
+            self._notify(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: {summary}")
 
         elif message.type == MessageType.FILE_REQUEST:
-            # _handle_file_request prints its own notification and the main
-            # loop shows the interactive prompt – no duplicate line needed here.
+            # _handle_file_request enqueues its own notification; nothing here.
             pass
 
         elif message.type == MessageType.FILE_TRANSFER:
             filename = message.payload.get("filename", "?")
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: '{filename}'")
+            self._notify(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: '{filename}'")
 
         elif message.type == MessageType.FILE_REJECTED:
             filename = message.payload.get("filename", "?")
             reason   = message.payload.get("reason", "declined")
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: '{filename}' – {reason}")
+            self._notify(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: '{filename}' – {reason}")
 
         elif message.type == MessageType.IDENTITY_EXCHANGE:
             fp = message.payload.get("fingerprint", "?")
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender} – sending ACK")
-            print(f"     Their fingerprint: {fp}")
+            self._notify(
+                f"  ← [{self.local_peer.peer_name}] {tag} from {sender} – sending ACK\n"
+                f"     Their fingerprint: {fp}"
+            )
 
         elif message.type == MessageType.IDENTITY_ACK:
             fp = message.payload.get("fingerprint", "?")
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}")
-            print(f"     Their fingerprint: {fp}")
+            self._notify(
+                f"  ← [{self.local_peer.peer_name}] {tag} from {sender}\n"
+                f"     Their fingerprint: {fp}"
+            )
+
+        elif message.type == MessageType.KEY_ROTATION:
+            old_fp = message.payload.get("old_fingerprint", "?")
+            new_fp = message.payload.get("new_fingerprint", "?")
+            self._notify(
+                f"  ← [{self.local_peer.peer_name}] {tag} from {sender}"
+                f" (old: {old_fp[:24]}… → new: {new_fp[:24]}…)"
+            )
 
         else:
-            print(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: {message.payload}")
+            self._notify(f"  ← [{self.local_peer.peer_name}] {tag} from {sender}: {message.payload}")

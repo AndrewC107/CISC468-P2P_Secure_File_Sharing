@@ -19,40 +19,64 @@ How symmetric discovery works
 
 File sharing
 ────────────
-Drop files you want to share into  storage/shared/  before starting.
-Received files land in  storage/downloads/  automatically.
+Drop files you want to share into  storage/shared/  before starting, OR
+use menu option 11 (Import file to share) to add an encrypted copy.
+Received files land in  storage/downloads/  (encrypted at rest).
 
-File transfer consent (terminal UX design)
-──────────────────────────────────────────
-When a remote peer requests a file, the server thread must NOT call
-input() directly.  Two threads calling input() simultaneously causes
-messy overlapping prompts because the OS can only deliver keystrokes to
-one reader at a time (see PendingConsentRequest in server.py for details).
+Storage passphrase (Requirement 9)
+────────────────────────────────────
+You are prompted for a passphrase at startup.  All received files are
+stored encrypted on disk (AES-256-GCM, key derived via PBKDF2-SHA256).
+The passphrase is never stored – only the PBKDF2 salt is saved in
+identity/storage_salt.bin.  Use the same passphrase every run.
+`
+Terminal UX design – two queues, one main thread
+─────────────────────────────────────────────────
+Background server threads must NOT call print() or input() while the
+main thread is blocked on input(), or output gets interleaved.
 
-Instead:
-  • Server thread  → enqueues a PendingConsentRequest, blocks on an Event.
-  • Main loop      → checks the queue before every menu render;
-                     if a request is waiting, shows a clean prompt,
-                     then calls req.resolve(accepted) to unblock the server.
-  • Server thread  → receives the decision, reads the file, sends response.
+Two queues solve this cleanly:
 
-This guarantees that input() is only ever called from the main thread,
-so prompts are always clean and never overlap.
+  notification_queue
+    Server threads push any string they would normally print() here.
+    The main loop drains it BEFORE rendering the menu, so notifications
+    always appear on clean lines above the menu, never after "Your choice:".
+
+  consent_queue
+    When a remote peer requests a file, the server thread enqueues a
+    PendingConsentRequest and blocks on an Event.  The main loop handles
+    it (shows a clean yes/no prompt) before each menu render, then calls
+    req.resolve(accepted) to unblock the server thread.
+
+This guarantees input() is only ever called from the main thread and all
+print() output from background threads is deferred to menu boundaries.
 """
 
+import getpass
 import logging
 import queue
 import threading
 
+from peer import catalog
 from peer import contacts as contact_store
 from peer.client import PeerClient
 from peer.config import DEFAULT_TCP_PORT, DOWNLOADS_DIR, SHARED_DIR
-from peer.crypto import format_fingerprint_for_display, load_or_generate_keys
+from peer.crypto import (
+    format_fingerprint_for_display,
+    load_or_generate_keys,
+    rotate_keys,
+)
 from peer.discovery import PeerDiscovery
-from peer.files import ensure_storage_dirs, list_shared_files
+from peer.files import (
+    ensure_storage_dirs,
+    import_file_to_shared,
+    list_downloaded_files,
+    list_shared_files,
+)
 from peer.models import Message, PeerInfo
 from peer.protocol import MessageType
 from peer.server import PeerServer, PendingConsentRequest
+from peer.storage import StorageKey
 from peer.utils import generate_peer_id, get_local_ip
 
 # ── Note on key deletion ───────────────────────────────────────────────────────
@@ -68,8 +92,16 @@ logging.basicConfig(level=logging.WARNING, format="[%(levelname)s] %(message)s")
 # Startup prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
-def prompt_startup() -> tuple[str, int]:
-    """Ask the user for a display name and TCP port."""
+def prompt_startup() -> tuple[str, int, StorageKey]:
+    """
+    Ask for display name, TCP port, and storage passphrase.
+
+    The passphrase is used to derive the AES-256 key that protects received
+    files at rest (Requirement 9).  The same passphrase must be used on every
+    launch so previously saved files can be decrypted.
+
+    Returns (name, port, storage_key).
+    """
     print()
     print("=" * 52)
     print("   P2P Secure Share")
@@ -77,7 +109,40 @@ def prompt_startup() -> tuple[str, int]:
     name       = input("  Your name   [Peer]  : ").strip() or "Peer"
     port_input = input(f"  TCP port    [{DEFAULT_TCP_PORT}]  : ").strip()
     port       = int(port_input) if port_input.isdigit() else DEFAULT_TCP_PORT
-    return name, port
+
+    print()
+    print("  Storage passphrase (protects received files at rest).")
+    print("  Use the SAME passphrase every launch.  Leave empty to skip")
+    print("  at-rest encryption (not recommended for sensitive data).")
+    try:
+        passphrase = getpass.getpass("  Passphrase: ")
+    except Exception:
+        passphrase = input("  Passphrase: ").strip()
+
+    if passphrase:
+        storage_key = StorageKey.derive(passphrase)
+        print("  Storage key derived  ✓")
+    else:
+        storage_key = None
+        print("  WARNING: No passphrase – received files will NOT be encrypted at rest.")
+
+    return name, port, storage_key
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Formatting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_size(size_bytes: int) -> str:
+    """Return a human-readable file size (e.g. '42 B', '1.4 KB', '3.2 MB')."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 ** 2:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 ** 3:
+        return f"{size_bytes / 1024 ** 2:.1f} MB"
+    else:
+        return f"{size_bytes / 1024 ** 3:.1f} GB"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,11 +167,8 @@ def handle_pending_consents(consent_queue: queue.Queue) -> None:
         try:
             req: PendingConsentRequest = consent_queue.get_nowait()
         except queue.Empty:
-            break   # no more pending requests – proceed to normal menu
+            break
 
-        # A request might already be resolved if the server thread timed out
-        # (25 s) before the main loop got here.  Showing a stale prompt would
-        # confuse the user, so skip it with a brief notice.
         if req.timed_out:
             print(
                 f"\n  (request from {req.peer_name} for '{req.filename}'"
@@ -114,7 +176,6 @@ def handle_pending_consents(consent_queue: queue.Queue) -> None:
             )
             continue
 
-        # ── Show the consent prompt ────────────────────────────────────────────
         print()
         print("  ┌─────────────────────────────────────────")
         print(f"  │  [REQUEST] {req.peer_name} wants \"{req.filename}\"")
@@ -129,7 +190,6 @@ def handle_pending_consents(consent_queue: queue.Queue) -> None:
             print(f"  ✗  Declined – '{req.filename}' will not be sent.")
             req.resolve(False)
 
-        # Small visual separator before the next request or the menu
         print()
 
 
@@ -151,6 +211,10 @@ def print_menu() -> None:
     print("  7  –  Show my fingerprint")
     print("  8  –  Show contacts")
     print("  9  –  Trust a contact")
+    print("  ─" * 21)
+    print("  10 –  Rotate my keys (key migration)")
+    print("  11 –  Import a file to share")
+    print("  12 –  Show downloaded files")
     print("  ─" * 21)
     print("  0  –  Exit")
     print("─" * 44)
@@ -195,17 +259,17 @@ def action_show_peers(discovery: PeerDiscovery) -> None:
         )
 
 
-def action_show_shared_files() -> None:
+def action_show_shared_files(storage_key: StorageKey | None = None) -> None:
     """Menu 2 – display the files in this peer's shared folder."""
-    files = list_shared_files()
+    files = list_shared_files(storage_key)
     if not files:
         print(f"  No files in {SHARED_DIR}/")
-        print( "  Drop files there to make them available to other peers.")
+        print( "  Drop plain files there, or use menu 11 to import an encrypted copy.")
         return
     print(f"  {len(files)} file(s) in {SHARED_DIR}/:")
     for i, f in enumerate(files, start=1):
-        size_kb = f["size"] / 1024
-        print(f"    {i}.  {f['filename']:30}  {size_kb:.1f} KB")
+        sha_part = f"  sha256:{f['sha256'][:12]}…" if f.get("sha256") else ""
+        print(f"    {i}.  {f['filename']:30}  {_fmt_size(f['size'])}{sha_part}")
 
 
 def action_send_hello(discovery: PeerDiscovery, client: PeerClient) -> None:
@@ -218,10 +282,18 @@ def action_send_hello(discovery: PeerDiscovery, client: PeerClient) -> None:
 def action_request_file_list(
     discovery: PeerDiscovery, client: PeerClient
 ) -> None:
-    """Menu 4 – fetch and display the chosen peer's shared file list."""
+    """
+    Menu 4 – fetch and display the chosen peer's shared file list.
+
+    Also updates the file catalog so offline fallback (Req 5) has up-to-date
+    hash information for that peer.
+    """
     peer = pick_peer(discovery)
-    if peer is not None:
-        client.request_file_list(peer.ip, peer.port)
+    if peer is None:
+        return
+    files = client.request_file_list(peer.ip, peer.port)
+    if files is not None:
+        catalog.update(peer.peer_id, peer.peer_name, files)
 
 
 def action_request_file(
@@ -232,9 +304,11 @@ def action_request_file(
 
     Flow:
       1. Pick a peer.
-      2. Fetch their file list.
+      2. Fetch their file list and update the catalog.
       3. Let the user choose a file by number.
       4. Send FILE_REQUEST and wait for FILE_TRANSFER or FILE_REJECTED.
+      5. If the peer is offline, offer to download from an alternate source
+         with hash-based integrity verification (Requirement 5).
     """
     peer = pick_peer(discovery)
     if peer is None:
@@ -242,8 +316,26 @@ def action_request_file(
 
     files = client.request_file_list(peer.ip, peer.port)
     if files is None:
-        print("  Could not retrieve file list – cannot continue.")
-        return
+        # Peer offline already at the file-list stage – still allow fallback
+        # if we have a cached catalog entry for them.
+        cached = [
+            {"filename": fn, **meta}
+            for fn, meta in catalog._catalog.get(peer.peer_id, {}).items()
+        ]
+        if cached:
+            print(
+                f"\n  ✗ {peer.peer_name} is offline.  Showing cached file list:\n"
+            )
+            for i, f in enumerate(cached, start=1):
+                sha_part = f"  sha256:{f['sha256'][:12]}…" if f.get("sha256") else ""
+                print(f"    {i}.  {f['filename']:30}  {sha_part}")
+            files = [{"filename": e["filename"], "sha256": e.get("sha256", "")} for e in cached]
+        else:
+            print("  Could not retrieve file list – cannot continue.")
+            return
+    else:
+        catalog.update(peer.peer_id, peer.peer_name, files)
+
     if not files:
         print(f"  {peer.peer_name} has no shared files.")
         return
@@ -253,8 +345,16 @@ def action_request_file(
         print("  Invalid choice.")
         return
 
-    filename = files[int(choice) - 1]["filename"]
-    client.request_file(peer.ip, peer.port, filename)
+    chosen      = files[int(choice) - 1]
+    filename    = chosen["filename"]
+    sha256_hint = chosen.get("sha256") or catalog.get_expected_hash(peer.peer_id, filename)
+
+    client.request_file(
+        peer.ip, peer.port, filename,
+        expected_sha256=sha256_hint,
+        original_peer_id=peer.peer_id,
+        get_peers=discovery.get_peers,
+    )
 
 
 def action_exchange_identity(
@@ -281,15 +381,7 @@ def action_show_my_fingerprint(local_peer: PeerInfo) -> None:
     """
     Menu 7 – display this peer's public-key fingerprint.
 
-    The fingerprint is the SHA-256 hash of the public key encoded as
-    colon-separated hex pairs.  Share this string with another person so they
-    can confirm they are connected to YOU and not an impostor.
-
-    How to use out-of-band verification:
-      1. Call or message the other person through a channel you already trust.
-      2. Read your fingerprint aloud (or paste it).
-      3. They compare it to the fingerprint saved under your name in their
-         contacts list.  If they match, you are verified.
+    Share this string out-of-band so others can verify they're talking to you.
     """
     if local_peer.fingerprint is None:
         print("  Identity keys not loaded – restart the app.")
@@ -305,9 +397,6 @@ def action_show_my_fingerprint(local_peer: PeerInfo) -> None:
 def action_show_contacts() -> None:
     """
     Menu 8 – list all saved contacts with their trust status.
-
-    Contacts are added automatically whenever IDENTITY_EXCHANGE is received.
-    Use 'Trust a contact' (menu 9) to mark a contact as verified.
     """
     contacts = contact_store.list_contacts()
     if not contacts:
@@ -324,13 +413,6 @@ def action_show_contacts() -> None:
 def action_trust_contact() -> None:
     """
     Menu 9 – mark a contact as trusted after out-of-band fingerprint verification.
-
-    Workflow:
-      1. The user compares the displayed fingerprint to the one they received
-         through a separate, already-trusted channel (phone call, etc.).
-      2. If they match, the user marks the contact as trusted here.
-      3. Trusted contacts are flagged in contacts.json and can be used in a
-         future phase to enable signature verification on incoming messages.
     """
     contacts = contact_store.list_contacts()
     unverified = [c for c in contacts if not c.get("trusted")]
@@ -365,20 +447,140 @@ def action_trust_contact() -> None:
         print("  Trust not granted.")
 
 
+def action_rotate_keys(
+    local_peer: PeerInfo,
+    server:     PeerServer,
+    client:     PeerClient,
+    discovery:  PeerDiscovery,
+    identity_ref: list,
+) -> None:
+    """
+    Menu 10 – generate new long-term keys and notify online contacts.
+
+    Requirement 6: "Allow users to migrate to a new key if their old one is
+    compromised.  Existing contacts should be notified, and any necessary steps
+    should be taken to re-establish authenticated and secure communication."
+
+    Rotation flow:
+      1. Generate new Ed25519 + X25519 key pairs and save them to identity/.
+      2. Sign a KEY_ROTATION message with the OLD private key and send it to
+         all currently online contacts.  The signature lets them verify the
+         rotation is authorised before updating their contact record.
+      3. Update local state (local_peer, server, client) with the new keys.
+
+    Contacts that are currently offline will receive no notification.  When
+    they come back online and you exchange identities again, they will receive
+    your new keys naturally.
+    """
+    print()
+    print("  ┌─────────────────────────────────────────────────────")
+    print("  │  KEY ROTATION")
+    print("  │  This generates a new long-term Ed25519 + X25519 key pair.")
+    print("  │  All currently online contacts will be notified automatically.")
+    print("  │  You will need to re-verify your fingerprint with each contact.")
+    print("  └─────────────────────────────────────────────────────")
+    confirm = input("  Proceed with key rotation? (y/n): ").strip().lower()
+    if confirm != "y":
+        print("  Rotation cancelled.")
+        return
+
+    old_identity = identity_ref[0]
+
+    # Step 1: generate new keys and save to identity/
+    new_identity = rotate_keys(old_identity)
+    print(f"\n  ✓ New keys generated.")
+    print(f"  New fingerprint:")
+    print(format_fingerprint_for_display(new_identity.fingerprint))
+
+    # Step 2: notify all currently online known contacts
+    online_peers   = discovery.get_peers()
+    all_contacts   = contact_store.list_contacts()
+    contact_ids    = {c["peer_id"] for c in all_contacts}
+    notified_count = 0
+
+    for peer in online_peers.values():
+        if peer.peer_id in contact_ids:
+            ok = client.send_key_rotation(peer.ip, peer.port, old_identity, new_identity)
+            if ok:
+                print(f"  → KEY_ROTATION sent to {peer.peer_name}")
+                notified_count += 1
+            else:
+                print(f"  ✗ Could not reach {peer.peer_name} (they are in contacts but offline now)")
+
+    if notified_count == 0:
+        print("  (No online contacts found to notify.)")
+
+    # Step 3: update in-memory state so new transfers use the new keys
+    identity_ref[0] = new_identity
+
+    local_peer.public_key     = new_identity.signing_public_key_pem
+    local_peer.encryption_key = new_identity.encryption_public_key_pem
+    local_peer.fingerprint    = new_identity.fingerprint
+
+    server.update_identity(
+        new_identity.signing_private_key,
+        new_identity.encryption_private_key,
+    )
+    client.update_identity(new_identity)
+
+    print(
+        f"\n  ✓ Key rotation complete.\n"
+        f"  Contacts that were offline were not notified automatically.\n"
+        f"  Re-run 'Exchange identity' with them after they come back online.\n"
+        f"  You should also re-verify your NEW fingerprint with all contacts.\n"
+    )
+
+
+def action_import_file(storage_key: StorageKey | None) -> None:
+    """
+    Menu 11 – import an external file into storage/shared/ (optionally encrypted).
+
+    When a storage key is active the file is stored encrypted (.enc) so that
+    anyone who accesses the filesystem cannot read it without the passphrase.
+    """
+    print("  Enter the full path of the file you want to share.")
+    print("  (Type 'cancel' to abort)")
+    path = input("  File path: ").strip()
+    if path.lower() == "cancel" or not path:
+        print("  Cancelled.")
+        return
+    try:
+        dest = import_file_to_shared(path, storage_key)
+        enc_note = " (encrypted at rest)" if storage_key else ""
+        print(f"  ✓ File imported to {dest}{enc_note}")
+    except FileNotFoundError as exc:
+        print(f"  ✗ {exc}")
+    except Exception as exc:
+        print(f"  ✗ Import failed: {exc}")
+
+
+def action_show_downloaded_files(storage_key: StorageKey | None) -> None:
+    """Menu 12 – list files saved to storage/downloads/ (decrypted names)."""
+    files = list_downloaded_files(storage_key)
+    if not files:
+        print(f"  No files in {DOWNLOADS_DIR}/")
+        return
+    print(f"  {len(files)} downloaded file(s) in {DOWNLOADS_DIR}/:")
+    for i, f in enumerate(files, start=1):
+        print(f"    {i}.  {f['filename']:30}  {_fmt_size(f['size'])}")
+    if storage_key:
+        print("  (files are encrypted at rest)")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     # ── 1. Startup ───────────────────────────────────────────────────────────
-    ensure_storage_dirs()   # create storage/shared/ and storage/downloads/
+    ensure_storage_dirs()
 
     # Load (or generate on first run) both the Ed25519 signing key pair and
     # the X25519 encryption key pair.  Private keys stay on disk in identity/.
     # Public keys and the fingerprint are shared via IDENTITY_EXCHANGE.
     identity = load_or_generate_keys()
 
-    name, port = prompt_startup()
+    name, port, storage_key = prompt_startup()
 
     local_peer = PeerInfo(
         peer_id=generate_peer_id(),
@@ -397,26 +599,29 @@ def main() -> None:
     print(f"  Signing key (Ed25519) fingerprint:")
     print(format_fingerprint_for_display(identity.fingerprint))
 
-    # ── 2. Create the shared consent queue and service objects ────────────────
-    #
-    # consent_queue is the bridge between the server's TCP threads and the
-    # main CLI thread.  The server enqueues PendingConsentRequest objects;
-    # handle_pending_consents() resolves them by calling req.resolve().
-    consent_queue: queue.Queue = queue.Queue()
+    # ── 2. Create the shared queues and service objects ───────────────────────
+    consent_queue:      queue.Queue = queue.Queue()
+    notification_queue: queue.Queue = queue.Queue()
 
     server    = PeerServer(
         host="0.0.0.0",
         port=port,
         local_peer=local_peer,
         consent_queue=consent_queue,
+        notification_queue=notification_queue,
         signing_private_key=identity.signing_private_key,
         encryption_private_key=identity.encryption_private_key,
+        storage_key=storage_key,
     )
     discovery = PeerDiscovery(local_peer=local_peer)
     client    = PeerClient(
         local_peer=local_peer,
         encryption_private_key=identity.encryption_private_key,
+        storage_key=storage_key,
     )
+
+    # Mutable wrapper so action_rotate_keys() can rebind identity in-place.
+    identity_ref = [identity]
 
     # ── 3. Define callbacks as closures (capture discovery + client) ──────────
 
@@ -463,13 +668,16 @@ def main() -> None:
     # ── 5. Interactive menu loop ──────────────────────────────────────────────
     try:
         while True:
-            # ── Handle any pending file-request consents FIRST ─────────────────
-            # This must come before print_menu() and the input() call so that:
-            #   a) the consent prompt is shown on a clean line, and
-            #   b) normal menu output does not print over an in-progress prompt.
+            # Drain background notifications first so they appear BEFORE the
+            # menu, never interleaved with "Your choice:" prompts.
+            while not notification_queue.empty():
+                try:
+                    print(notification_queue.get_nowait())
+                except queue.Empty:
+                    break
+
             handle_pending_consents(consent_queue)
 
-            # ── Show menu and read choice ──────────────────────────────────────
             print()
             print_menu()
             choice = input("  Your choice: ").strip()
@@ -477,7 +685,7 @@ def main() -> None:
             if choice == "1":
                 action_show_peers(discovery)
             elif choice == "2":
-                action_show_shared_files()
+                action_show_shared_files(storage_key)
             elif choice == "3":
                 action_send_hello(discovery, client)
             elif choice == "4":
@@ -492,11 +700,18 @@ def main() -> None:
                 action_show_contacts()
             elif choice == "9":
                 action_trust_contact()
+            elif choice == "10":
+                action_rotate_keys(local_peer, server, client, discovery, identity_ref)
+                identity = identity_ref[0]
+            elif choice == "11":
+                action_import_file(storage_key)
+            elif choice == "12":
+                action_show_downloaded_files(storage_key)
             elif choice == "0":
                 print("  Goodbye!")
                 break
             else:
-                print("  Please enter 0–9.")
+                print("  Please enter 0–12.")
 
     except KeyboardInterrupt:
         print("\n  Interrupted.")

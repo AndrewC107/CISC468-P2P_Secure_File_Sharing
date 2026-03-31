@@ -483,3 +483,116 @@ def _load_x25519_private() -> X25519PrivateKey:
     if not isinstance(key, X25519PrivateKey):
         raise ValueError("Stored encryption key is not X25519 – delete identity/ and restart")
     return key
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Key rotation helpers (Requirement 6)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rotate_keys(old_identity: "LocalIdentity") -> "LocalIdentity":
+    """
+    Generate a brand-new Ed25519 + X25519 key pair and save them to identity/.
+
+    The old identity object is accepted as a parameter (used by the caller to
+    sign the KEY_ROTATION announcement) but is NOT modified here – this function
+    only writes the new keys to disk and returns a fresh LocalIdentity.
+
+    After calling this the caller should:
+      1. Build and send KEY_ROTATION notifications to online contacts using
+         sign_key_rotation() with old_identity.signing_private_key.
+      2. Replace the in-memory identity reference and update server/client keys
+         via their update_identity() methods.
+
+    Requirement: "Allow users to migrate to a new key if their old one is
+    compromised.  Existing contacts should be notified."
+    """
+    new_signing_priv = Ed25519PrivateKey.generate()
+    new_signing_pub_pem = _save_ed25519_pair(new_signing_priv)
+
+    new_enc_priv = X25519PrivateKey.generate()
+    new_enc_pub_pem = _save_x25519_pair(new_enc_priv)
+
+    new_fingerprint = compute_fingerprint(new_signing_pub_pem)
+
+    return LocalIdentity(
+        signing_private_key=new_signing_priv,
+        signing_public_key_pem=new_signing_pub_pem,
+        fingerprint=new_fingerprint,
+        encryption_private_key=new_enc_priv,
+        encryption_public_key_pem=new_enc_pub_pem,
+    )
+
+
+def sign_key_rotation(
+    old_signing_key:       Ed25519PrivateKey,
+    old_fingerprint:       str,
+    new_public_key_pem:    str,
+    new_encryption_key_pem: str,
+    new_fingerprint:       str,
+) -> bytes:
+    """
+    Sign a key rotation announcement with the OLD private key.
+
+    The signature lets contacts verify that the rotation was authorised by the
+    true key holder – an attacker who only has the new key cannot forge this.
+
+    Returns raw Ed25519 signature bytes (64 bytes).
+
+    [AUTHENTICATION] Only the holder of the old private key can produce a
+    valid signature over these fields.
+    """
+    data = _build_rotation_sign_target(
+        old_fingerprint, new_public_key_pem, new_encryption_key_pem, new_fingerprint
+    )
+    return old_signing_key.sign(data)
+
+
+def verify_key_rotation(
+    old_public_key_pem:    str,
+    old_fingerprint:       str,
+    new_public_key_pem:    str,
+    new_encryption_key_pem: str,
+    new_fingerprint:       str,
+    signature:             bytes,
+) -> bool:
+    """
+    Verify a KEY_ROTATION signature using the contact's previously stored
+    (old) Ed25519 public key.
+
+    Returns True only if the signature is valid, False on any failure.
+    A False result means the rotation message must be rejected (Req 10).
+    """
+    try:
+        pub_key = load_pem_public_key(old_public_key_pem.encode("utf-8"))
+        data = _build_rotation_sign_target(
+            old_fingerprint, new_public_key_pem, new_encryption_key_pem, new_fingerprint
+        )
+        pub_key.verify(signature, data)  # type: ignore[arg-type]
+        return True
+    except (InvalidSignature, Exception):
+        return False
+
+
+def _build_rotation_sign_target(
+    old_fingerprint:       str,
+    new_public_key_pem:    str,
+    new_encryption_key_pem: str,
+    new_fingerprint:       str,
+) -> bytes:
+    """
+    Build the canonical byte string that is signed / verified for key rotation.
+
+    Null-byte delimiters separate every field so no field can bleed into
+    another (prevents length-extension and field-substitution attacks).
+
+    Java equivalent (concatenate in this exact order):
+        "KEY_ROTATION\\0" + old_fingerprint + "\\0" + new_public_key_pem
+        + "\\0" + new_encryption_key_pem + "\\0" + new_fingerprint
+    """
+    return (
+        b"KEY_ROTATION\x00"
+        + old_fingerprint.encode("utf-8")       + b"\x00"
+        + new_public_key_pem.encode("utf-8")    + b"\x00"
+        + new_encryption_key_pem.encode("utf-8") + b"\x00"
+        + new_fingerprint.encode("utf-8")
+    )

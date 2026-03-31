@@ -46,6 +46,20 @@ class MessageType:
     IDENTITY_EXCHANGE   = "identity_exchange"   # Send our public key to a peer
     IDENTITY_ACK        = "identity_ack"        # Acknowledge and send our own key back
 
+    # ── Key rotation (Requirement 6) ──────────────────────────────────────────
+    # When a user migrates to a new long-term key pair, they broadcast a
+    # KEY_ROTATION message to all currently online contacts.  The message is
+    # signed with the OLD private key so recipients can verify the change is
+    # authorised before updating their contact record.
+    #
+    # Payload fields:
+    #   old_fingerprint   – SHA-256 fingerprint of the OLD Ed25519 public key
+    #   new_public_key    – PEM-encoded NEW Ed25519 public key (SubjectPublicKeyInfo)
+    #   new_encryption_key– PEM-encoded NEW X25519 public key (SubjectPublicKeyInfo)
+    #   new_fingerprint   – SHA-256 fingerprint of the NEW Ed25519 public key
+    #   signature         – base64(Ed25519_sign(old_key, canonical_rotation_data))
+    KEY_ROTATION        = "key_rotation"        # Announce that our keys have changed
+
 
 # ── Required fields (validated on every inbound message) ───────────────
 _REQUIRED_FIELDS: tuple[str, ...] = (
