@@ -136,7 +136,7 @@ public final class CryptoService {
 
     public byte[] x25519PublicKeyRaw(PublicKey x25519Public) {
         XECPublicKey x = (XECPublicKey) x25519Public;
-        return unsignedBigIntToFixed32(x.getU());
+        return unsignedBigIntToLittleEndian32(x.getU());
     }
 
     public byte[] x25519PublicRawFromPem(String pem) throws Exception {
@@ -146,7 +146,10 @@ public final class CryptoService {
 
     public byte[] ecdhDeriveKey(PrivateKey localPrivate, byte[] peerRawPublic32) throws Exception {
         KeyFactory kf = KeyFactory.getInstance("XDH");
-        BigInteger u = new BigInteger(1, peerRawPublic32);
+        if (peerRawPublic32.length != X25519_RAW_LEN) {
+            throw new IllegalArgumentException("X25519 public key must be exactly 32 bytes");
+        }
+        BigInteger u = littleEndian32ToUnsignedBigInt(peerRawPublic32);
         XECPublicKeySpec spec = new XECPublicKeySpec(NamedParameterSpec.X25519, u);
         PublicKey peerPublic = kf.generatePublic(spec);
 
@@ -227,17 +230,33 @@ public final class CryptoService {
         return buf.array();
     }
 
-    private static byte[] unsignedBigIntToFixed32(BigInteger u) {
+    private static byte[] unsignedBigIntToLittleEndian32(BigInteger u) {
         byte[] tb = u.toByteArray();
+        byte[] be32;
         if (tb.length == 33 && tb[0] == 0) {
-            return Arrays.copyOfRange(tb, 1, 33);
+            be32 = Arrays.copyOfRange(tb, 1, 33);
+        } else if (tb.length > 32) {
+            be32 = Arrays.copyOfRange(tb, tb.length - 32, tb.length);
+        } else {
+            be32 = new byte[32];
+            System.arraycopy(tb, 0, be32, 32 - tb.length, tb.length);
         }
-        if (tb.length > 32) {
-            return Arrays.copyOfRange(tb, tb.length - 32, tb.length);
+        reverseInPlace(be32);
+        return be32;
+    }
+
+    private static BigInteger littleEndian32ToUnsignedBigInt(byte[] le32) {
+        byte[] be = Arrays.copyOf(le32, le32.length);
+        reverseInPlace(be);
+        return new BigInteger(1, be);
+    }
+
+    private static void reverseInPlace(byte[] a) {
+        for (int i = 0, j = a.length - 1; i < j; i++, j--) {
+            byte t = a[i];
+            a[i] = a[j];
+            a[j] = t;
         }
-        byte[] out = new byte[32];
-        System.arraycopy(tb, 0, out, 32 - tb.length, tb.length);
-        return out;
     }
 
     public static String formatFingerprintForDisplay(String fingerprint) {
@@ -248,5 +267,92 @@ public final class CryptoService {
         String row1 = String.join(":", Arrays.copyOfRange(parts, 0, 16));
         String row2 = String.join(":", Arrays.copyOfRange(parts, 16, 32));
         return "  " + row1 + "\n  " + row2;
+    }
+
+    public LocalIdentity rotateKeys(Config cfg) throws Exception {
+        KeyPairGenerator signKpg = KeyPairGenerator.getInstance("Ed25519");
+        KeyPair signPair = signKpg.generateKeyPair();
+        KeyPairGenerator encKpg = KeyPairGenerator.getInstance("XDH");
+        encKpg.initialize(NamedParameterSpec.X25519);
+        KeyPair encPair = encKpg.generateKeyPair();
+
+        PemUtil.writePem(cfg.ed25519PrivatePem(), "PRIVATE KEY", signPair.getPrivate().getEncoded());
+        PemUtil.writePem(cfg.ed25519PublicPem(), "PUBLIC KEY", signPair.getPublic().getEncoded());
+        PemUtil.writePem(cfg.x25519PrivatePem(), "PRIVATE KEY", encPair.getPrivate().getEncoded());
+        PemUtil.writePem(cfg.x25519PublicPem(), "PUBLIC KEY", encPair.getPublic().getEncoded());
+
+        String signPubPem = Files.readString(cfg.ed25519PublicPem(), StandardCharsets.UTF_8);
+        String encPubPem = Files.readString(cfg.x25519PublicPem(), StandardCharsets.UTF_8);
+        String fp = computeFingerprint(signPair.getPublic());
+        return new LocalIdentity(
+                signPair.getPrivate(),
+                signPair.getPublic(),
+                signPubPem,
+                fp,
+                encPair.getPrivate(),
+                encPair.getPublic(),
+                encPubPem);
+    }
+
+    public byte[] signKeyRotation(
+            PrivateKey oldSigningKey,
+            String oldFingerprint,
+            String newPublicKeyPem,
+            String newEncryptionKeyPem,
+            String newFingerprint) throws Exception {
+        Signature sig = Signature.getInstance("Ed25519");
+        sig.initSign(oldSigningKey);
+        sig.update(buildRotationSignTarget(oldFingerprint, newPublicKeyPem, newEncryptionKeyPem, newFingerprint));
+        return sig.sign();
+    }
+
+    public boolean verifyKeyRotation(
+            String oldPublicKeyPem,
+            String oldFingerprint,
+            String newPublicKeyPem,
+            String newEncryptionKeyPem,
+            String newFingerprint,
+            byte[] signature) {
+        try {
+            PublicKey pub = loadEd25519PublicFromPem(oldPublicKeyPem);
+            Signature sig = Signature.getInstance("Ed25519");
+            sig.initVerify(pub);
+            sig.update(buildRotationSignTarget(oldFingerprint, newPublicKeyPem, newEncryptionKeyPem, newFingerprint));
+            return sig.verify(signature);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    public static byte[] buildRotationSignTarget(
+            String oldFingerprint,
+            String newPublicKeyPem,
+            String newEncryptionKeyPem,
+            String newFingerprint) {
+        byte[] pfx = "KEY_ROTATION\u0000".getBytes(StandardCharsets.UTF_8);
+        byte[] oldFp = oldFingerprint.getBytes(StandardCharsets.UTF_8);
+        byte[] newPub = newPublicKeyPem.getBytes(StandardCharsets.UTF_8);
+        byte[] newEnc = newEncryptionKeyPem.getBytes(StandardCharsets.UTF_8);
+        byte[] newFp = newFingerprint.getBytes(StandardCharsets.UTF_8);
+        byte[] sep = new byte[] {0};
+
+        byte[] out = new byte[pfx.length + oldFp.length + sep.length + newPub.length + sep.length + newEnc.length + sep.length + newFp.length];
+        int pos = 0;
+        System.arraycopy(pfx, 0, out, pos, pfx.length);
+        pos += pfx.length;
+        System.arraycopy(oldFp, 0, out, pos, oldFp.length);
+        pos += oldFp.length;
+        System.arraycopy(sep, 0, out, pos, 1);
+        pos += 1;
+        System.arraycopy(newPub, 0, out, pos, newPub.length);
+        pos += newPub.length;
+        System.arraycopy(sep, 0, out, pos, 1);
+        pos += 1;
+        System.arraycopy(newEnc, 0, out, pos, newEnc.length);
+        pos += newEnc.length;
+        System.arraycopy(sep, 0, out, pos, 1);
+        pos += 1;
+        System.arraycopy(newFp, 0, out, pos, newFp.length);
+        return out;
     }
 }

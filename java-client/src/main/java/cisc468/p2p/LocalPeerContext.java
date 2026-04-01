@@ -4,13 +4,13 @@
 package cisc468.p2p;
 
 public final class LocalPeerContext {
-    public final String peerId;
-    public final String peerName;
-    public final String ip;
-    public final int port;
-    public final String signingPublicKeyPem;
-    public final String encryptionPublicKeyPem;
-    public final String fingerprint;
+    public String peerId;
+    public String peerName;
+    public String ip;
+    public int port;
+    public String signingPublicKeyPem;
+    public String encryptionPublicKeyPem;
+    public String fingerprint;
 
     public LocalPeerContext(
             String peerId,

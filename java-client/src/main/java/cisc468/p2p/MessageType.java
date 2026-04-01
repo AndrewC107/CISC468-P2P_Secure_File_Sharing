@@ -16,6 +16,7 @@ public final class MessageType {
     public static final String FILE_REJECTED = "file_rejected";
     public static final String IDENTITY_EXCHANGE = "identity_exchange";
     public static final String IDENTITY_ACK = "identity_ack";
+    public static final String KEY_ROTATION = "key_rotation";
 
     private MessageType() {}
 }

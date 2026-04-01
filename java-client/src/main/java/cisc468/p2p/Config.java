@@ -60,6 +60,14 @@ public final class Config {
         return contactsDir().resolve("contacts.json");
     }
 
+    public Path catalogFile() {
+        return contactsDir().resolve("file_catalog.json");
+    }
+
+    public Path storageSaltFile() {
+        return identityDir().resolve("storage_salt.bin");
+    }
+
     public Path ed25519PrivatePem() {
         return identityDir().resolve("private_key.pem");
     }

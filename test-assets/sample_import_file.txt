@@ -1,0 +1,5 @@
+P2P Secure Share test file
+Generated for menu option 11 import testing.
+
+If this imports correctly, it should appear in storage/shared/
+(as plaintext or .enc depending on whether you entered a storage passphrase).

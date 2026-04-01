@@ -7,12 +7,16 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 
 import javax.crypto.AEADBadTagException;
+import java.security.PrivateKey;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.file.Path;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Supplier;
 
 public final class PeerClient {
 
@@ -21,14 +25,28 @@ public final class PeerClient {
 
     private final LocalPeerContext local;
     private final ContactStore contacts;
+    private final FileCatalog catalog;
     private final CryptoService crypto;
     private final FileStore files;
+    private final StorageKey storageKey;
+    private volatile PrivateKey encryptionPrivateKey;
+    private volatile boolean lastConnFailed;
 
-    public PeerClient(LocalPeerContext local, ContactStore contacts, CryptoService crypto, FileStore files) {
+    public PeerClient(
+            LocalPeerContext local,
+            ContactStore contacts,
+            FileCatalog catalog,
+            CryptoService crypto,
+            FileStore files,
+            PrivateKey encryptionPrivateKey,
+            StorageKey storageKey) {
         this.local = local;
         this.contacts = contacts;
+        this.catalog = catalog;
         this.crypto = crypto;
         this.files = files;
+        this.encryptionPrivateKey = encryptionPrivateKey;
+        this.storageKey = storageKey;
     }
 
     public boolean sendMessage(String peerIp, int peerPort, Message message) {
@@ -42,6 +60,7 @@ public final class PeerClient {
     }
 
     public Message sendAndRecv(String peerIp, int peerPort, Message message, int timeoutMs) {
+        lastConnFailed = false;
         try (Socket sock = new Socket()) {
             sock.connect(new InetSocketAddress(peerIp, peerPort), CONNECT_TIMEOUT_MS);
             sock.setSoTimeout(timeoutMs);
@@ -52,9 +71,14 @@ public final class PeerClient {
             }
             return ProtocolJson.decodeMessage(raw);
         } catch (Exception e) {
+            lastConnFailed = true;
             System.out.printf("  ✗ Error communicating with %s:%d – %s%n", peerIp, peerPort, e.getMessage());
             return null;
         }
+    }
+
+    public void updateIdentity(LocalIdentity newIdentity) {
+        this.encryptionPrivateKey = newIdentity.encryptionPrivateKey();
     }
 
     public Message sendHello(String peerIp, int peerPort) {
@@ -86,14 +110,18 @@ public final class PeerClient {
                 JsonObject o = el.getAsJsonObject();
                 String name = o.get("filename").getAsString();
                 long size = o.get("size").getAsNumber().longValue();
-                out.add(new FileStore.FileEntry(name, size));
+                String sha256 = o.has("sha256") ? o.get("sha256").getAsString() : "";
+                out.add(new FileStore.FileEntry(name, size, sha256));
             }
         }
         if (!out.isEmpty()) {
             System.out.printf("  ✓ [%s] %d file(s) shared by %s:%n", local.peerName, out.size(), resp.sender_name);
             int i = 1;
             for (FileStore.FileEntry f : out) {
-                System.out.printf("      %d.  %s  (%s)%n", i++, f.filename(), fmtSize(f.size()));
+                String hashPart = (f.sha256() != null && !f.sha256().isBlank())
+                        ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "…"
+                        : "";
+                System.out.printf("      %d.  %s  (%s)%s%n", i++, f.filename(), fmtSize(f.size()), hashPart);
             }
         } else {
             System.out.printf("  ✓ [%s] %s has no shared files.%n", local.peerName, resp.sender_name);
@@ -105,7 +133,9 @@ public final class PeerClient {
             String peerIp,
             int peerPort,
             String filename,
-            java.security.PrivateKey encryptionPrivateKey) throws Exception {
+            String expectedSha256,
+            String originalPeerId,
+            Supplier<Map<String, PeerInfo>> getPeers) throws Exception {
         JsonObject p = new JsonObject();
         p.addProperty("filename", filename);
         Message req = Message.create(
@@ -114,21 +144,32 @@ public final class PeerClient {
         System.out.printf("     (waiting for %s:%d to accept – up to 30 s)%n", peerIp, peerPort);
         Message resp = sendAndRecv(peerIp, peerPort, req, FILE_TRANSFER_TIMEOUT_MS);
         if (resp == null) {
+            if (lastConnFailed
+                    && expectedSha256 != null
+                    && !expectedSha256.isBlank()
+                    && originalPeerId != null
+                    && getPeers != null) {
+                return tryAlternateSources(filename, expectedSha256, originalPeerId, getPeers);
+            }
             return false;
         }
+        return processFileTransferResponse(resp, filename, expectedSha256);
+    }
+
+    private boolean processFileTransferResponse(Message resp, String filename, String expectedSha256) throws Exception {
         if (MessageType.FILE_TRANSFER.equals(resp.type)) {
             boolean encrypted = resp.payload.has("encrypted") && resp.payload.get("encrypted").getAsBoolean();
             String recvName = resp.payload.has("filename")
                     ? resp.payload.get("filename").getAsString()
                     : filename;
             if (encrypted) {
-                return receiveEncryptedFile(resp, recvName, encryptionPrivateKey);
+                return receiveEncryptedFile(resp, recvName, expectedSha256);
             }
             if (!resp.payload.has("data")) {
                 return false;
             }
             String b64 = resp.payload.get("data").getAsString();
-            files.writeDownload(recvName, Base64.getDecoder().decode(b64));
+            files.writeDownloadSecure(recvName, Base64.getDecoder().decode(b64), storageKey);
             System.out.printf("  ✓ '%s' saved to %s%n", recvName, files.downloadsDirDisplay());
             return true;
         }
@@ -141,8 +182,64 @@ public final class PeerClient {
         return false;
     }
 
-    private boolean receiveEncryptedFile(Message response, String filename, java.security.PrivateKey encPriv)
+    private boolean tryAlternateSources(
+            String filename,
+            String expectedSha256,
+            String originalPeerId,
+            Supplier<Map<String, PeerInfo>> getPeers) throws Exception {
+        Map<String, PeerInfo> peers = getPeers.get();
+        List<String> candidates = catalog.findAlternatePeers(
+                filename,
+                expectedSha256,
+                originalPeerId,
+                new ArrayList<>(peers.keySet()));
+        if (candidates.isEmpty()) {
+            System.out.printf(
+                    "  ✗ No alternate sources found for '%s'.%n     No other known peer has advertised this file with the same hash.%n",
+                    filename);
+            return false;
+        }
+        List<String> names = new ArrayList<>();
+        for (String pid : candidates) {
+            if (peers.containsKey(pid)) {
+                names.add(peers.get(pid).peerName);
+            }
+        }
+        System.out.printf(
+                "%n  ↻  Primary peer is offline.  Alternate source(s) found:%n     %s%n     The downloaded file will be verified against the original hash.%n",
+                String.join(", ", names));
+        System.out.print("  Try alternate source? (y/n): ");
+        String confirm = new java.util.Scanner(System.in).nextLine().strip().toLowerCase();
+        if (!"y".equals(confirm)) {
+            System.out.println("  Fallback cancelled.");
+            return false;
+        }
+
+        for (String pid : candidates) {
+            PeerInfo alt = peers.get(pid);
+            if (alt == null) {
+                continue;
+            }
+            System.out.printf("%n  → Trying alternate source: %s @ %s:%d%n", alt.peerName, alt.ip, alt.port);
+            JsonObject p = new JsonObject();
+            p.addProperty("filename", filename);
+            Message req = Message.create(MessageType.FILE_REQUEST, local.peerId, local.peerName, local.port, p);
+            System.out.printf("     (waiting up to 30 s for %s to accept)%n", alt.peerName);
+            Message resp = sendAndRecv(alt.ip, alt.port, req, FILE_TRANSFER_TIMEOUT_MS);
+            if (resp == null) {
+                continue;
+            }
+            if (processFileTransferResponse(resp, filename, expectedSha256)) {
+                return true;
+            }
+        }
+        System.out.printf("  ✗ All alternate sources failed for '%s'.%n", filename);
+        return false;
+    }
+
+    private boolean receiveEncryptedFile(Message response, String filename, String expectedSha256)
             throws Exception {
+        PrivateKey encPriv = this.encryptionPrivateKey;
         if (encPriv == null) {
             System.out.printf("  ✗ Cannot decrypt '%s' – client has no encryption key.%n", filename);
             return false;
@@ -192,14 +289,26 @@ public final class PeerClient {
             System.out.printf("  ✗ Decryption error for '%s': %s%n", filename, e.getMessage());
             return false;
         }
-        files.writeDownload(filename, plaintext);
+
+        if (expectedSha256 != null && !expectedSha256.isBlank()) {
+            String actual = sha256Hex(plaintext);
+            if (!actual.equals(expectedSha256)) {
+                System.out.printf(
+                        "%n  ✗ SECURITY WARNING: Content hash MISMATCH for '%s'.%n     Expected : %s%n     Received : %s%n     File discarded – NOT saved.%n%n",
+                        filename, expectedSha256, actual);
+                return false;
+            }
+            System.out.println("  ✓ Content hash verified (matches original peer's advertised hash)");
+        }
+
+        Path dest = files.writeDownloadSecure(filename, plaintext, storageKey);
         long orig = response.payload.has("original_size")
                 ? response.payload.get("original_size").getAsLong()
                 : plaintext.length;
-        Path dest = files.downloadsDir().resolve(filename);
+        String atRest = storageKey != null ? " (encrypted at rest)" : "";
         System.out.printf(
-                "  ✓ 🔓 '%s' decrypted and saved to %s  (%,d bytes)%n",
-                filename, dest, orig);
+                "  ✓ '%s' decrypted and saved to %s  (%,d bytes)%s%n",
+                filename, dest, orig, atRest);
         return true;
     }
 
@@ -233,6 +342,33 @@ public final class PeerClient {
                     local.peerName, ack.sender_name);
         }
         return ack;
+    }
+
+    public boolean sendKeyRotation(
+            String peerIp,
+            int peerPort,
+            LocalIdentity oldIdentity,
+            LocalIdentity newIdentity) throws Exception {
+        byte[] sig = crypto.signKeyRotation(
+                oldIdentity.signingPrivateKey(),
+                oldIdentity.fingerprint(),
+                newIdentity.signingPublicKeyPem(),
+                newIdentity.encryptionPublicKeyPem(),
+                newIdentity.fingerprint());
+
+        JsonObject p = new JsonObject();
+        p.addProperty("old_fingerprint", oldIdentity.fingerprint());
+        p.addProperty("new_public_key", newIdentity.signingPublicKeyPem());
+        p.addProperty("new_encryption_key", newIdentity.encryptionPublicKeyPem());
+        p.addProperty("new_fingerprint", newIdentity.fingerprint());
+        p.addProperty("signature", Base64.getEncoder().encodeToString(sig));
+        Message m = Message.create(MessageType.KEY_ROTATION, local.peerId, local.peerName, local.port, p);
+        return sendMessage(peerIp, peerPort, m);
+    }
+
+    private static String sha256Hex(byte[] data) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        return java.util.HexFormat.of().formatHex(md.digest(data));
     }
 
     private static String fmtSize(long sizeBytes) {

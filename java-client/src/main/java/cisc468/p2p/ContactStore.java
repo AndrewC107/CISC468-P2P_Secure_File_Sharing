@@ -42,6 +42,7 @@ public final class ContactStore {
             boolean trusted,
             String encryptionKeyOrNull) throws Exception {
         ContactsFile data = loadAll();
+        // 1) exact peer_id match
         for (ContactRecord entry : data.contacts) {
             if (peerId.equals(entry.peerId)) {
                 entry.peerName = peerName;
@@ -57,6 +58,26 @@ public final class ContactStore {
                 return;
             }
         }
+        // 2) fingerprint match (peer restarted with new session UUID)
+        if (fingerprint != null && !fingerprint.isBlank()) {
+            for (ContactRecord entry : data.contacts) {
+                if (fingerprint.equals(entry.fingerprint)) {
+                    entry.peerId = peerId;
+                    entry.peerName = peerName;
+                    entry.publicKey = publicKey;
+                    entry.fingerprint = fingerprint;
+                    if (encryptionKeyOrNull != null) {
+                        entry.encryptionKey = encryptionKeyOrNull;
+                    }
+                    if (!entry.trusted) {
+                        entry.trusted = trusted;
+                    }
+                    saveAll(data);
+                    return;
+                }
+            }
+        }
+        // 3) new contact
         ContactRecord n = new ContactRecord();
         n.peerId = peerId;
         n.peerName = peerName;
@@ -73,6 +94,37 @@ public final class ContactStore {
         for (ContactRecord entry : data.contacts) {
             if (peerId.equals(entry.peerId)) {
                 entry.trusted = trusted;
+                saveAll(data);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public synchronized ContactRecord getContactByFingerprint(String fingerprint) throws Exception {
+        if (fingerprint == null || fingerprint.isBlank()) {
+            return null;
+        }
+        ContactsFile data = loadAll();
+        for (ContactRecord entry : data.contacts) {
+            if (fingerprint.equals(entry.fingerprint)) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    public synchronized boolean updateContactKeys(
+            String peerId,
+            String newPublicKey,
+            String newEncryptionKey,
+            String newFingerprint) throws Exception {
+        ContactsFile data = loadAll();
+        for (ContactRecord entry : data.contacts) {
+            if (peerId.equals(entry.peerId)) {
+                entry.publicKey = newPublicKey;
+                entry.encryptionKey = newEncryptionKey;
+                entry.fingerprint = newFingerprint;
                 saveAll(data);
                 return true;
             }

@@ -20,11 +20,14 @@ public final class PeerServer implements AutoCloseable {
     private static final double CONSENT_TIMEOUT_SEC = 25.0;
 
     private final LocalPeerContext local;
-    private final LocalIdentity identity;
+    private volatile java.security.PrivateKey signingPrivateKey;
+    private volatile java.security.PrivateKey encryptionPrivateKey;
     private final ContactStore contacts;
     private final CryptoService crypto;
     private final FileStore files;
     private final BlockingQueue<PendingConsentRequest> consentQueue;
+    private final BlockingQueue<String> notificationQueue;
+    private final StorageKey storageKey;
     private final BiConsumer<Message, String> onMessage; // (message, remoteIp)
 
     private volatile boolean running;
@@ -38,13 +41,18 @@ public final class PeerServer implements AutoCloseable {
             CryptoService crypto,
             FileStore files,
             BlockingQueue<PendingConsentRequest> consentQueue,
+            BlockingQueue<String> notificationQueue,
+            StorageKey storageKey,
             BiConsumer<Message, String> onMessage) {
         this.local = local;
-        this.identity = identity;
+        this.signingPrivateKey = identity.signingPrivateKey();
+        this.encryptionPrivateKey = identity.encryptionPrivateKey();
         this.contacts = contacts;
         this.crypto = crypto;
         this.files = files;
         this.consentQueue = consentQueue;
+        this.notificationQueue = notificationQueue;
+        this.storageKey = storageKey;
         this.onMessage = onMessage;
     }
 
@@ -90,6 +98,19 @@ public final class PeerServer implements AutoCloseable {
         }
     }
 
+    private void notifyLine(String line) {
+        if (notificationQueue != null) {
+            notificationQueue.offer(line);
+        } else {
+            System.out.println(line);
+        }
+    }
+
+    public void updateIdentity(LocalIdentity identity) {
+        this.signingPrivateKey = identity.signingPrivateKey();
+        this.encryptionPrivateKey = identity.encryptionPrivateKey();
+    }
+
     private void handleConnection(Socket conn) {
         try (conn) {
             conn.setSoTimeout(120_000);
@@ -131,6 +152,10 @@ public final class PeerServer implements AutoCloseable {
                 yield null;
             }
             case MessageType.IDENTITY_EXCHANGE -> handleIdentityExchange(message);
+            case MessageType.KEY_ROTATION -> {
+                handleKeyRotation(message);
+                yield null;
+            }
             default -> null;
         };
     }
@@ -141,7 +166,7 @@ public final class PeerServer implements AutoCloseable {
 
     private Message handleFileListRequest() throws Exception {
         JsonObject p = new JsonObject();
-        p.add("files", files.listSharedFilesJson());
+        p.add("files", files.listSharedFilesJson(storageKey));
         return Message.create(
                 MessageType.FILE_LIST_RESPONSE, local.peerId, local.peerName, local.port, p);
     }
@@ -153,7 +178,7 @@ public final class PeerServer implements AutoCloseable {
         if (contact == null || contact.encryptionKey == null || contact.encryptionKey.isBlank()) {
             return rejected(filename, "encrypted transfer requires identity exchange – ask the requester to use menu option 6 (Exchange identity) first");
         }
-        if (identity.signingPrivateKey() == null) {
+        if (signingPrivateKey == null) {
             return rejected(filename, "server has no signing key configured – restart the application");
         }
         if (consentQueue == null) {
@@ -169,7 +194,7 @@ public final class PeerServer implements AutoCloseable {
         if (!accepted) {
             return rejected(filename, "declined by user");
         }
-        byte[] plaintext = files.readSharedFileBytes(filename);
+        byte[] plaintext = files.readSharedFileBytes(filename, storageKey);
         if (plaintext == null) {
             System.out.printf("  ✗ [%s] File '%s' not found in storage/shared/%n", local.peerName, filename);
             return rejected(filename, "file not found");
@@ -182,7 +207,7 @@ public final class PeerServer implements AutoCloseable {
             CryptoService.AesGcmPacket packet = crypto.aesGcmEncrypt(aesKey, plaintext);
             byte[] signature =
                     crypto.signTransfer(
-                            identity.signingPrivateKey(),
+                            signingPrivateKey,
                             filename,
                             ephPubRaw,
                             packet.nonce(),
@@ -219,15 +244,15 @@ public final class PeerServer implements AutoCloseable {
                 return;
             }
             String b64 = message.payload.get("data").getAsString();
-            files.writeDownload(filename, Base64.getDecoder().decode(b64));
-            System.out.printf("%n  ✓ File received: '%s' saved to %s%n", filename, files.downloadsDirDisplay());
+            files.writeDownloadSecure(filename, Base64.getDecoder().decode(b64), storageKey);
+            notifyLine(String.format("%n  ✓ File received: '%s' saved to %s%n", filename, files.downloadsDirDisplay()));
             return;
         }
         receiveEncryptedPush(message, filename);
     }
 
     private void receiveEncryptedPush(Message message, String filename) throws Exception {
-        if (identity.encryptionPrivateKey() == null) {
+        if (encryptionPrivateKey == null) {
             System.out.printf("  ✗ Cannot decrypt '%s' – no encryption key configured.%n", filename);
             return;
         }
@@ -259,7 +284,7 @@ public final class PeerServer implements AutoCloseable {
                     filename, message.sender_name);
             return;
         }
-        byte[] aesKey = crypto.ecdhDeriveKey(identity.encryptionPrivateKey(), ephPub);
+        byte[] aesKey = crypto.ecdhDeriveKey(encryptionPrivateKey, ephPub);
         byte[] plaintext;
         try {
             plaintext = crypto.aesGcmDecrypt(aesKey, nonce, ciphertext);
@@ -271,10 +296,11 @@ public final class PeerServer implements AutoCloseable {
                     filename, message.sender_name);
             return;
         }
-        files.writeDownload(filename, plaintext);
-        System.out.printf(
-                "%n  ✓ 🔓 File received and decrypted: '%s' saved to %s  (%,d bytes, signature verified)%n%n",
-                filename, files.downloadsDir().resolve(filename), plaintext.length);
+        var dest = files.writeDownloadSecure(filename, plaintext, storageKey);
+        String atRest = storageKey != null ? " (encrypted at rest)" : "";
+        notifyLine(String.format(
+                "%n  ✓ 🔓 File received and decrypted: '%s' saved to %s  (%,d bytes, signature verified)%s%n",
+                filename, dest, plaintext.length, atRest));
     }
 
     private Message handleIdentityExchange(Message message) throws Exception {
@@ -302,6 +328,59 @@ public final class PeerServer implements AutoCloseable {
         ackP.addProperty("fingerprint", local.fingerprint);
         return Message.create(
                 MessageType.IDENTITY_ACK, local.peerId, local.peerName, local.port, ackP);
+    }
+
+    private void handleKeyRotation(Message message) throws Exception {
+        JsonObject p = message.payload;
+        String oldFp = p.has("old_fingerprint") ? p.get("old_fingerprint").getAsString() : "";
+        String newPub = p.has("new_public_key") ? p.get("new_public_key").getAsString() : "";
+        String newEnc = p.has("new_encryption_key") ? p.get("new_encryption_key").getAsString() : "";
+        String newFp = p.has("new_fingerprint") ? p.get("new_fingerprint").getAsString() : "";
+        String b64Sig = p.has("signature") ? p.get("signature").getAsString() : "";
+        if (oldFp.isBlank() || newPub.isBlank() || newFp.isBlank() || b64Sig.isBlank()) {
+            notifyLine("  ✗ Malformed KEY_ROTATION from " + message.sender_name + " – missing fields, ignored");
+            return;
+        }
+        ContactRecord contact = contacts.getContactByFingerprint(oldFp);
+        if (contact == null) {
+            String shortFp = oldFp.length() > 24 ? oldFp.substring(0, 24) + "…" : oldFp;
+            notifyLine("  ✗ KEY_ROTATION from " + message.sender_name + ": no contact with fingerprint " + shortFp + " – ignored");
+            return;
+        }
+        byte[] sig;
+        try {
+            sig = Base64.getDecoder().decode(b64Sig);
+        } catch (Exception e) {
+            notifyLine("  ✗ KEY_ROTATION from " + message.sender_name + ": invalid base64 signature – ignored");
+            return;
+        }
+        boolean valid = crypto.verifyKeyRotation(
+                contact.publicKey,
+                oldFp,
+                newPub,
+                newEnc,
+                newFp,
+                sig);
+        if (!valid) {
+            notifyLine(
+                    "\n  ✗ SECURITY WARNING: KEY_ROTATION from "
+                            + message.sender_name
+                            + " has INVALID signature.\n"
+                            + "     This may be a spoofed rotation attempt.  Contact NOT updated.\n");
+            return;
+        }
+        contacts.updateContactKeys(contact.peerId, newPub, newEnc, newFp);
+        notifyLine(
+                "\n  ⚿  Key rotation verified for "
+                        + message.sender_name
+                        + ".\n"
+                        + "     Old fingerprint: "
+                        + oldFp
+                        + "\n"
+                        + "     New fingerprint: "
+                        + newFp
+                        + "\n"
+                        + "     Contact record updated.  Re-verify the new fingerprint out-of-band.\n");
     }
 
     private void printReceived(Message message, String host) {
@@ -334,6 +413,13 @@ public final class PeerServer implements AutoCloseable {
                 String fp = message.payload.has("fingerprint") ? message.payload.get("fingerprint").getAsString() : "?";
                 System.out.printf(
                         "  ← [%s] %s from %s%n     Their fingerprint: %s%n", local.peerName, tag, sender, fp);
+            }
+            case MessageType.KEY_ROTATION -> {
+                String oldFp = message.payload.has("old_fingerprint") ? message.payload.get("old_fingerprint").getAsString() : "?";
+                String newFp = message.payload.has("new_fingerprint") ? message.payload.get("new_fingerprint").getAsString() : "?";
+                String oldShort = oldFp.length() > 24 ? oldFp.substring(0, 24) + "…" : oldFp;
+                String newShort = newFp.length() > 24 ? newFp.substring(0, 24) + "…" : newFp;
+                notifyLine(String.format("  ← [%s] %s from %s (old: %s → new: %s)", local.peerName, tag, sender, oldShort, newShort));
             }
             default -> {
                 /* quiet */
