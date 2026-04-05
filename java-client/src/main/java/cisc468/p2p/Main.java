@@ -44,9 +44,9 @@ public final class Main {
             StorageKey storageKey = null;
             if (!passphrase.isEmpty()) {
                 storageKey = StorageKey.derive(config, passphrase);
-                System.out.println("  Storage key derived  ✓");
+                System.out.println("  Storage key derived  [OK]");
             } else {
-                System.out.println("  WARNING: No passphrase – files will NOT be encrypted at rest.");
+                System.out.println("  WARNING: No passphrase - files will NOT be encrypted at rest.");
             }
 
             String peerId = UUID.randomUUID().toString();
@@ -159,7 +159,7 @@ public final class Main {
                     System.out.println("  Goodbye!");
                     return;
                 }
-                default -> System.out.println("  Please enter 0–12.");
+                default -> System.out.println("  Please enter 0-12.");
             }
         }
     }
@@ -173,17 +173,17 @@ public final class Main {
                 continue;
             }
             System.out.println();
-            System.out.println("  ┌─────────────────────────────────────────");
-            System.out.printf("  │  [REQUEST] %s wants \"%s\"%n", req.peerName, req.filename);
-            System.out.printf("  │  from %s:%d%n", req.peerIp, req.peerPort);
-            System.out.println("  └─────────────────────────────────────────");
+            System.out.println("  -----------------------------------------");
+            System.out.printf("  [REQUEST] %s wants \"%s\"%n", req.peerName, req.filename);
+            System.out.printf("  from %s:%d%n", req.peerIp, req.peerPort);
+            System.out.println("  -----------------------------------------");
             System.out.print("  Accept? (y/n): ");
             String answer = scanner.nextLine().strip().toLowerCase();
             if ("y".equals(answer)) {
-                System.out.printf("  ✓  Accepted – sending '%s' to %s…%n", req.filename, req.peerName);
+                System.out.printf("  [OK] Accepted - sending '%s' to %s...%n", req.filename, req.peerName);
                 req.resolve(true);
             } else {
-                System.out.printf("  ✗  Declined – '%s' will not be sent.%n", req.filename);
+                System.out.printf("  [NO] Declined - '%s' will not be sent.%n", req.filename);
                 req.resolve(false);
             }
             System.out.println();
@@ -191,32 +191,32 @@ public final class Main {
     }
 
     private static void printMenu() {
-        System.out.println("─".repeat(44));
+        System.out.println("-".repeat(44));
         System.out.println("  MENU");
-        System.out.println("─".repeat(44));
-        System.out.println("  1  –  Show discovered peers");
-        System.out.println("  2  –  Show my shared files");
-        System.out.println("  3  –  Send HELLO to a peer");
-        System.out.println("  4  –  Request file list from a peer");
-        System.out.println("  5  –  Request a file from a peer");
-        System.out.println("  " + "─".repeat(21));
-        System.out.println("  6  –  Exchange identity with a peer");
-        System.out.println("  7  –  Show my fingerprint");
-        System.out.println("  8  –  Show contacts");
-        System.out.println("  9  –  Trust a contact");
-        System.out.println("  " + "─".repeat(21));
-        System.out.println("  10 –  Rotate my keys (key migration)");
-        System.out.println("  11 –  Import a file to share");
-        System.out.println("  12 –  Show downloaded files");
-        System.out.println("  " + "─".repeat(21));
-        System.out.println("  0  –  Exit");
-        System.out.println("─".repeat(44));
+        System.out.println("-".repeat(44));
+        System.out.println("  1  -  Show discovered peers");
+        System.out.println("  2  -  Show my shared files");
+        System.out.println("  3  -  Send HELLO to a peer");
+        System.out.println("  4  -  Request file list from a peer");
+        System.out.println("  5  -  Request a file from a peer");
+        System.out.println("  " + "-".repeat(21));
+        System.out.println("  6  -  Exchange identity with a peer");
+        System.out.println("  7  -  Show my fingerprint");
+        System.out.println("  8  -  Show contacts");
+        System.out.println("  9  -  Trust a contact");
+        System.out.println("  " + "-".repeat(21));
+        System.out.println("  10 -  Rotate my keys (key migration)");
+        System.out.println("  11 -  Import a file to share");
+        System.out.println("  12 -  Show downloaded files");
+        System.out.println("  " + "-".repeat(21));
+        System.out.println("  0  -  Exit");
+        System.out.println("-".repeat(44));
     }
 
     private static PeerInfo pickPeer(Scanner scanner, PeerDiscovery discovery) {
         List<PeerInfo> peers = new ArrayList<>(discovery.getPeers().values());
         if (peers.isEmpty()) {
-            System.out.println("  No peers discovered yet – wait a moment and try again.");
+            System.out.println("  No peers discovered yet - wait a moment and try again.");
             return null;
         }
         if (peers.size() == 1) {
@@ -250,7 +250,7 @@ public final class Main {
         System.out.printf("  %d peer(s) on the network:%n", peers.size());
         for (PeerInfo p : peers.values()) {
             String shortId = p.peerId.substring(0, Math.min(8, p.peerId.length()));
-            System.out.printf("    •  %-15s  addr: %s:%d  id: %s…%n", p.peerName, p.ip, p.port, shortId);
+            System.out.printf("    *  %-15s  addr: %s:%d  id: %s...%n", p.peerName, p.ip, p.port, shortId);
         }
     }
 
@@ -265,7 +265,7 @@ public final class Main {
         int i = 1;
         for (FileStore.FileEntry f : list) {
             String hashPart = (f.sha256() != null && !f.sha256().isBlank())
-                    ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "…"
+                    ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "..."
                     : "";
             System.out.printf("    %d.  %-30s  %s%s%n", i++, f.filename(), fmtSize(f.size()), hashPart);
         }
@@ -292,16 +292,16 @@ public final class Main {
         if (files == null) {
             files = catalog.getPeerFiles(p.peerId);
             if (!files.isEmpty()) {
-                System.out.printf("%n  ✗ %s is offline.  Showing cached file list:%n%n", p.peerName);
+                System.out.printf("%n  [ERR] %s is offline.  Showing cached file list:%n%n", p.peerName);
                 int i = 1;
                 for (FileStore.FileEntry f : files) {
                     String hashPart = (f.sha256() != null && !f.sha256().isBlank())
-                            ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "…"
+                            ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "..."
                             : "";
                     System.out.printf("    %d.  %-30s%s%n", i++, f.filename(), hashPart);
                 }
             } else {
-                System.out.println("  Could not retrieve file list – cannot continue.");
+                System.out.println("  Could not retrieve file list - cannot continue.");
                 return;
             }
         } else {
@@ -360,9 +360,9 @@ public final class Main {
         System.out.printf("  %d contact(s):%n", list.size());
         int i = 1;
         for (ContactRecord c : list) {
-            String trustLabel = c.trusted ? "✓ trusted" : "  unverified";
+            String trustLabel = c.trusted ? "trusted" : "unverified";
             String shortId = c.peerId.substring(0, Math.min(8, c.peerId.length()));
-            System.out.printf("  %2d.  [%s]  %-15s  %s…%n", i++, trustLabel, c.peerName, shortId);
+            System.out.printf("  %2d.  [%s]  %-15s  %s...%n", i++, trustLabel, c.peerName, shortId);
             System.out.printf("         Fingerprint: %s%n", c.fingerprint);
         }
     }
@@ -379,7 +379,7 @@ public final class Main {
         for (int i = 0; i < unverified.size(); i++) {
             ContactRecord c = unverified.get(i);
             String shortId = c.peerId.substring(0, Math.min(8, c.peerId.length()));
-            System.out.printf("  %2d.  %-15s  %s…%n", i + 1, c.peerName, shortId);
+            System.out.printf("  %2d.  %-15s  %s...%n", i + 1, c.peerName, shortId);
             System.out.printf("         Fingerprint: %s%n", c.fingerprint);
         }
         System.out.print("  Enter contact number to trust (or Enter to cancel): ");
@@ -405,7 +405,7 @@ public final class Main {
         String confirm = scanner.nextLine().strip().toLowerCase();
         if ("y".equals(confirm)) {
             contacts.setTrusted(target.peerId, true);
-            System.out.printf("  ✓ %s is now marked as trusted.%n", target.peerName);
+            System.out.printf("  [OK] %s is now marked as trusted.%n", target.peerName);
         } else {
             System.out.println("  Trust not granted.");
         }
@@ -422,12 +422,12 @@ public final class Main {
             LocalIdentity[] identityRef,
             PeerServer server) throws Exception {
         System.out.println();
-        System.out.println("  ┌─────────────────────────────────────────────────────");
-        System.out.println("  │  KEY ROTATION");
-        System.out.println("  │  This generates a new long-term Ed25519 + X25519 key pair.");
-        System.out.println("  │  All currently online contacts will be notified automatically.");
-        System.out.println("  │  You will need to re-verify your fingerprint with each contact.");
-        System.out.println("  └─────────────────────────────────────────────────────");
+        System.out.println("  -----------------------------------------------------");
+        System.out.println("  KEY ROTATION");
+        System.out.println("  This generates a new long-term Ed25519 + X25519 key pair.");
+        System.out.println("  All currently online contacts will be notified automatically.");
+        System.out.println("  You will need to re-verify your fingerprint with each contact.");
+        System.out.println("  -----------------------------------------------------");
         System.out.print("  Proceed with key rotation? (y/n): ");
         if (!"y".equals(scanner.nextLine().strip().toLowerCase())) {
             System.out.println("  Rotation cancelled.");
@@ -436,7 +436,7 @@ public final class Main {
 
         LocalIdentity oldIdentity = identityRef[0];
         LocalIdentity newIdentity = crypto.rotateKeys(config);
-        System.out.println("\n  ✓ New keys generated.");
+        System.out.println("\n  [OK] New keys generated.");
         System.out.println("  New fingerprint:");
         System.out.println(CryptoService.formatFingerprintForDisplay(newIdentity.fingerprint()));
 
@@ -449,10 +449,10 @@ public final class Main {
             if (!contactIds.contains(peer.peerId)) continue;
             boolean ok = client.sendKeyRotation(peer.ip, peer.port, oldIdentity, newIdentity);
             if (ok) {
-                System.out.printf("  → KEY_ROTATION sent to %s%n", peer.peerName);
+                System.out.printf("  -> KEY_ROTATION sent to %s%n", peer.peerName);
                 notified++;
             } else {
-                System.out.printf("  ✗ Could not reach %s (they are in contacts but offline now)%n", peer.peerName);
+                System.out.printf("  [ERR] Could not reach %s (they are in contacts but offline now)%n", peer.peerName);
             }
         }
         if (notified == 0) {
@@ -467,7 +467,7 @@ public final class Main {
         server.updateIdentity(newIdentity);
 
         System.out.println(
-                "\n  ✓ Key rotation complete.\n"
+                "\n  [OK] Key rotation complete.\n"
                         + "  Contacts that were offline were not notified automatically.\n"
                         + "  Re-run 'Exchange identity' with them after they come back online.\n"
                         + "  You should also re-verify your NEW fingerprint with all contacts.\n");
@@ -485,9 +485,9 @@ public final class Main {
         try {
             var dest = files.importFileToShared(path, storageKey);
             String encNote = storageKey != null ? " (encrypted at rest)" : "";
-            System.out.printf("  ✓ File imported to %s%s%n", dest, encNote);
+            System.out.printf("  [OK] File imported to %s%s%n", dest, encNote);
         } catch (Exception e) {
-            System.out.printf("  ✗ Import failed: %s%n", e.getMessage());
+            System.out.printf("  [ERR] Import failed: %s%n", e.getMessage());
         }
     }
 

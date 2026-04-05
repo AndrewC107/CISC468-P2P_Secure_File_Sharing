@@ -40,7 +40,7 @@ public final class PeerDiscovery {
         txThread.start();
         rxThread.start();
         System.out.printf(
-                "  [discovery] '%s' started – UDP port %d, interval %ds%n",
+                "  [discovery] '%s' started - UDP port %d, interval %ds%n",
                 local.peerName, Config.DISCOVERY_PORT, Config.BROADCAST_INTERVAL_SECONDS);
     }
 
@@ -62,7 +62,7 @@ public final class PeerDiscovery {
                 return existing;
             }
             System.out.printf(
-                    "%n  ✦ [%s] Peer registered via TCP: '%s' @ %s:%d%n%n",
+                    "%n  [NEW] [%s] Peer registered via TCP: '%s' @ %s:%d%n%n",
                     local.peerName, p.peerName, p.ip, p.port);
             return p;
         });
@@ -134,7 +134,7 @@ public final class PeerDiscovery {
                     });
                     if (isNew[0] && onPeerFound != null) {
                         System.out.printf(
-                                "%n  ✦ [%s] New peer discovered via UDP: '%s' @ %s:%d%n%n",
+                                "%n  [NEW] [%s] New peer discovered via UDP: '%s' @ %s:%d%n%n",
                                 local.peerName, peerName, ip, tcpPort);
                         onPeerFound.accept(newPeer);
                     }

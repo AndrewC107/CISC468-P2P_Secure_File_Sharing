@@ -29,7 +29,7 @@ You are prompted for a passphrase at startup.  All received files are
 stored encrypted on disk (AES-256-GCM, key derived via PBKDF2-SHA256).
 The passphrase is never stored – only the PBKDF2 salt is saved in
 identity/storage_salt.bin.  Use the same passphrase every run.
-`
+
 Terminal UX design – two queues, one main thread
 ─────────────────────────────────────────────────
 Background server threads must NOT call print() or input() while the

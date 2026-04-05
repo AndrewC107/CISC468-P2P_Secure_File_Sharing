@@ -72,7 +72,7 @@ public final class PeerClient {
             return ProtocolJson.decodeMessage(raw);
         } catch (Exception e) {
             lastConnFailed = true;
-            System.out.printf("  ✗ Error communicating with %s:%d – %s%n", peerIp, peerPort, e.getMessage());
+            System.out.printf("  [ERR] Error communicating with %s:%d - %s%n", peerIp, peerPort, e.getMessage());
             return null;
         }
     }
@@ -83,10 +83,10 @@ public final class PeerClient {
 
     public Message sendHello(String peerIp, int peerPort) {
         Message msg = Message.create(MessageType.HELLO, local.peerId, local.peerName, local.port, new JsonObject());
-        System.out.printf("  → [%s] Sending HELLO to %s:%d%n", local.peerName, peerIp, peerPort);
+        System.out.printf("  -> [%s] Sending HELLO to %s:%d%n", local.peerName, peerIp, peerPort);
         Message ack = sendAndRecv(peerIp, peerPort, msg, CONNECT_TIMEOUT_MS);
         if (ack != null && MessageType.HELLO_ACK.equals(ack.type)) {
-            System.out.printf("  ✓ [%s] HELLO_ACK received from %s%n", local.peerName, ack.sender_name);
+            System.out.printf("  [OK] [%s] HELLO_ACK received from %s%n", local.peerName, ack.sender_name);
             return ack;
         }
         return null;
@@ -95,7 +95,7 @@ public final class PeerClient {
     public List<FileStore.FileEntry> requestFileList(String peerIp, int peerPort) throws Exception {
         Message req = Message.create(
                 MessageType.FILE_LIST_REQUEST, local.peerId, local.peerName, local.port, new JsonObject());
-        System.out.printf("  → [%s] Requesting file list from %s:%d%n", local.peerName, peerIp, peerPort);
+        System.out.printf("  -> [%s] Requesting file list from %s:%d%n", local.peerName, peerIp, peerPort);
         Message resp = sendAndRecv(peerIp, peerPort, req, CONNECT_TIMEOUT_MS);
         if (resp == null) {
             return null;
@@ -115,16 +115,16 @@ public final class PeerClient {
             }
         }
         if (!out.isEmpty()) {
-            System.out.printf("  ✓ [%s] %d file(s) shared by %s:%n", local.peerName, out.size(), resp.sender_name);
+            System.out.printf("  [OK] [%s] %d file(s) shared by %s:%n", local.peerName, out.size(), resp.sender_name);
             int i = 1;
             for (FileStore.FileEntry f : out) {
                 String hashPart = (f.sha256() != null && !f.sha256().isBlank())
-                        ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "…"
+                        ? "  sha256:" + f.sha256().substring(0, Math.min(12, f.sha256().length())) + "..."
                         : "";
                 System.out.printf("      %d.  %s  (%s)%s%n", i++, f.filename(), fmtSize(f.size()), hashPart);
             }
         } else {
-            System.out.printf("  ✓ [%s] %s has no shared files.%n", local.peerName, resp.sender_name);
+            System.out.printf("  [OK] [%s] %s has no shared files.%n", local.peerName, resp.sender_name);
         }
         return out;
     }
@@ -140,8 +140,8 @@ public final class PeerClient {
         p.addProperty("filename", filename);
         Message req = Message.create(
                 MessageType.FILE_REQUEST, local.peerId, local.peerName, local.port, p);
-        System.out.printf("  → [%s] Requesting '%s' from %s:%d…%n", local.peerName, filename, peerIp, peerPort);
-        System.out.printf("     (waiting for %s:%d to accept – up to 30 s)%n", peerIp, peerPort);
+        System.out.printf("  -> [%s] Requesting '%s' from %s:%d...%n", local.peerName, filename, peerIp, peerPort);
+        System.out.printf("     (waiting for %s:%d to accept - up to 30 s)%n", peerIp, peerPort);
         Message resp = sendAndRecv(peerIp, peerPort, req, FILE_TRANSFER_TIMEOUT_MS);
         if (resp == null) {
             if (lastConnFailed
@@ -170,13 +170,13 @@ public final class PeerClient {
             }
             String b64 = resp.payload.get("data").getAsString();
             files.writeDownloadSecure(recvName, Base64.getDecoder().decode(b64), storageKey);
-            System.out.printf("  ✓ '%s' saved to %s%n", recvName, files.downloadsDirDisplay());
+            System.out.printf("  [OK] '%s' saved to %s%n", recvName, files.downloadsDirDisplay());
             return true;
         }
         if (MessageType.FILE_REJECTED.equals(resp.type)) {
             String reason = resp.payload.has("reason") ? resp.payload.get("reason").getAsString() : "declined";
             System.out.printf(
-                    "  ✗ %s declined to send '%s': %s%n", resp.sender_name, filename, reason);
+                    "  [ERR] %s declined to send '%s': %s%n", resp.sender_name, filename, reason);
             return false;
         }
         return false;
@@ -195,7 +195,7 @@ public final class PeerClient {
                 new ArrayList<>(peers.keySet()));
         if (candidates.isEmpty()) {
             System.out.printf(
-                    "  ✗ No alternate sources found for '%s'.%n     No other known peer has advertised this file with the same hash.%n",
+                    "  [ERR] No alternate sources found for '%s'.%n     No other known peer has advertised this file with the same hash.%n",
                     filename);
             return false;
         }
@@ -206,7 +206,7 @@ public final class PeerClient {
             }
         }
         System.out.printf(
-                "%n  ↻  Primary peer is offline.  Alternate source(s) found:%n     %s%n     The downloaded file will be verified against the original hash.%n",
+                "%n  [INFO] Primary peer is offline. Alternate source(s) found:%n     %s%n     The downloaded file will be verified against the original hash.%n",
                 String.join(", ", names));
         System.out.print("  Try alternate source? (y/n): ");
         String confirm = new java.util.Scanner(System.in).nextLine().strip().toLowerCase();
@@ -220,7 +220,7 @@ public final class PeerClient {
             if (alt == null) {
                 continue;
             }
-            System.out.printf("%n  → Trying alternate source: %s @ %s:%d%n", alt.peerName, alt.ip, alt.port);
+            System.out.printf("%n  -> Trying alternate source: %s @ %s:%d%n", alt.peerName, alt.ip, alt.port);
             JsonObject p = new JsonObject();
             p.addProperty("filename", filename);
             Message req = Message.create(MessageType.FILE_REQUEST, local.peerId, local.peerName, local.port, p);
@@ -233,7 +233,7 @@ public final class PeerClient {
                 return true;
             }
         }
-        System.out.printf("  ✗ All alternate sources failed for '%s'.%n", filename);
+        System.out.printf("  [ERR] All alternate sources failed for '%s'.%n", filename);
         return false;
     }
 
@@ -241,7 +241,7 @@ public final class PeerClient {
             throws Exception {
         PrivateKey encPriv = this.encryptionPrivateKey;
         if (encPriv == null) {
-            System.out.printf("  ✗ Cannot decrypt '%s' – client has no encryption key.%n", filename);
+            System.out.printf("  [ERR] Cannot decrypt '%s' - client has no encryption key.%n", filename);
             return false;
         }
         byte[] ephPub;
@@ -254,39 +254,39 @@ public final class PeerClient {
             ciphertext = Base64.getDecoder().decode(response.payload.get("ciphertext").getAsString());
             signature = Base64.getDecoder().decode(response.payload.get("signature").getAsString());
         } catch (Exception e) {
-            System.out.printf("  ✗ Malformed encrypted FILE_TRANSFER for '%s': %s%n", filename, e.getMessage());
+            System.out.printf("  [ERR] Malformed encrypted FILE_TRANSFER for '%s': %s%n", filename, e.getMessage());
             return false;
         }
         ContactRecord contact = contacts.getContact(response.sender_id);
         if (contact == null || contact.publicKey == null || contact.publicKey.isBlank()) {
             System.out.printf(
-                    "  ✗ SECURITY: Cannot verify '%s' from %s – their signing key is not in your contacts.%n"
+                    "  [ERR] SECURITY: Cannot verify '%s' from %s - their signing key is not in your contacts.%n"
                             + "     Use menu option 6 (Exchange identity) with this peer first.%n",
                     filename, response.sender_name);
             return false;
         }
         if (!crypto.verifyTransferSignature(contact.publicKey, filename, ephPub, nonce, ciphertext, signature)) {
             System.out.printf(
-                    "%n  ✗ SECURITY WARNING: Signature verification FAILED for '%s' from %s.%n"
+                    "%n  [ERR] SECURITY WARNING: Signature verification FAILED for '%s' from %s.%n"
                             + "     The file may have been tampered with or sent by an impostor.%n"
-                            + "     File discarded – NOT saved.%n%n",
+                            + "     File discarded - NOT saved.%n%n",
                     filename, response.sender_name);
             return false;
         }
-        System.out.printf("  ✓ Signature verified for '%s' (sender: %s)%n", filename, response.sender_name);
+        System.out.printf("  [OK] Signature verified for '%s' (sender: %s)%n", filename, response.sender_name);
         byte[] aesKey = crypto.ecdhDeriveKey(encPriv, ephPub);
         byte[] plaintext;
         try {
             plaintext = crypto.aesGcmDecrypt(aesKey, nonce, ciphertext);
         } catch (AEADBadTagException e) {
             System.out.printf(
-                    "%n  ✗ SECURITY WARNING: Integrity check FAILED for '%s' from %s.%n"
-                            + "     The authentication tag is invalid – the ciphertext was corrupted"
-                            + " or tampered with.%n     File discarded – NOT saved.%n%n",
+                    "%n  [ERR] SECURITY WARNING: Integrity check FAILED for '%s' from %s.%n"
+                            + "     The authentication tag is invalid - the ciphertext was corrupted"
+                            + " or tampered with.%n     File discarded - NOT saved.%n%n",
                     filename, response.sender_name);
             return false;
         } catch (Exception e) {
-            System.out.printf("  ✗ Decryption error for '%s': %s%n", filename, e.getMessage());
+            System.out.printf("  [ERR] Decryption error for '%s': %s%n", filename, e.getMessage());
             return false;
         }
 
@@ -294,11 +294,11 @@ public final class PeerClient {
             String actual = sha256Hex(plaintext);
             if (!actual.equals(expectedSha256)) {
                 System.out.printf(
-                        "%n  ✗ SECURITY WARNING: Content hash MISMATCH for '%s'.%n     Expected : %s%n     Received : %s%n     File discarded – NOT saved.%n%n",
+                        "%n  [ERR] SECURITY WARNING: Content hash MISMATCH for '%s'.%n     Expected : %s%n     Received : %s%n     File discarded - NOT saved.%n%n",
                         filename, expectedSha256, actual);
                 return false;
             }
-            System.out.println("  ✓ Content hash verified (matches original peer's advertised hash)");
+            System.out.println("  [OK] Content hash verified (matches original peer's advertised hash)");
         }
 
         Path dest = files.writeDownloadSecure(filename, plaintext, storageKey);
@@ -307,7 +307,7 @@ public final class PeerClient {
                 : plaintext.length;
         String atRest = storageKey != null ? " (encrypted at rest)" : "";
         System.out.printf(
-                "  ✓ '%s' decrypted and saved to %s  (%,d bytes)%s%n",
+                "  [OK] '%s' decrypted and saved to %s  (%,d bytes)%s%n",
                 filename, dest, orig, atRest);
         return true;
     }
@@ -320,10 +320,10 @@ public final class PeerClient {
         p.addProperty("encryption_key", local.encryptionPublicKeyPem);
         p.addProperty("fingerprint", local.fingerprint);
         Message req = Message.create(MessageType.IDENTITY_EXCHANGE, local.peerId, local.peerName, local.port, p);
-        System.out.printf("  → [%s] Sending IDENTITY_EXCHANGE to %s:%d%n", local.peerName, peerIp, peerPort);
+        System.out.printf("  -> [%s] Sending IDENTITY_EXCHANGE to %s:%d%n", local.peerName, peerIp, peerPort);
         Message ack = sendAndRecv(peerIp, peerPort, req, CONNECT_TIMEOUT_MS);
         if (ack == null || !MessageType.IDENTITY_ACK.equals(ack.type)) {
-            System.out.printf("  ✗ No IDENTITY_ACK received from %s:%d%n", peerIp, peerPort);
+            System.out.printf("  [ERR] No IDENTITY_ACK received from %s:%d%n", peerIp, peerPort);
             return null;
         }
         String pub = ack.payload.has("public_key") ? ack.payload.get("public_key").getAsString() : "";
@@ -333,12 +333,12 @@ public final class PeerClient {
             contacts.saveContact(ack.sender_id, ack.sender_name, pub, fp, false, enc.isBlank() ? null : enc);
             String encStatus = enc.isBlank() ? "signing key only" : "with encryption key";
             System.out.printf(
-                    "  ✓ [%s] Identity exchanged with %s (%s)%n", local.peerName, ack.sender_name, encStatus);
+                    "  [OK] [%s] Identity exchanged with %s (%s)%n", local.peerName, ack.sender_name, encStatus);
             System.out.printf("     Their fingerprint: %s%n", fp);
-            System.out.println("     Contact saved as unverified – use 'Trust a contact' to verify.");
+            System.out.println("     Contact saved as unverified - use 'Trust a contact' to verify.");
         } else {
             System.out.printf(
-                    "  ✓ [%s] IDENTITY_ACK from %s (no public key in response)%n",
+                    "  [OK] [%s] IDENTITY_ACK from %s (no public key in response)%n",
                     local.peerName, ack.sender_name);
         }
         return ack;
