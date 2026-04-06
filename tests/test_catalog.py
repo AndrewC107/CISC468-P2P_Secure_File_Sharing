@@ -1,17 +1,4 @@
-"""
-tests/test_catalog.py – Unit tests for offline peer fallback (Requirement 5)
-
-Covers:
-  • catalog.update() stores peer file lists with sha256 hashes
-  • catalog.get_expected_hash() retrieves the correct hash
-  • catalog.find_alternate_peers() returns matching alternates
-  • find_alternate_peers() excludes the offline peer itself
-  • find_alternate_peers() ignores peers with matching filename but wrong hash
-  • find_alternate_peers() returns empty list when no alternates exist
-  • Hash integrity verification in PeerClient._receive_encrypted_file:
-      correct hash → file saved
-      wrong hash   → file discarded with security warning
-"""
+# tests/test_catalog.py – catalog persistence and alternate-peer lookup (Req 5).
 
 import hashlib
 import os
@@ -21,14 +8,10 @@ import pytest
 import peer.catalog as catalog_mod
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def _fresh_catalog():
     """Reset the in-memory catalog between tests."""
     catalog_mod._catalog.clear()
 
-
-# ── catalog.update ────────────────────────────────────────────────────────────
 
 class TestCatalogUpdate:
     def setup_method(self):
@@ -62,11 +45,25 @@ class TestCatalogUpdate:
         catalog_mod.update("peer-c", "Carol", [
             {"size": 999, "sha256": "should-be-ignored"},
         ])
-        # No filename key → entry is skipped
         assert catalog_mod._catalog.get("peer-c", {}) == {}
 
 
-# ── catalog.get_expected_hash ─────────────────────────────────────────────────
+class TestGetPeerFiles:
+    def setup_method(self):
+        _fresh_catalog()
+
+    def test_returns_list_of_dicts_for_peer(self):
+        catalog_mod.update("peer-x", "Xavier", [
+            {"filename": "a.txt", "size": 1, "sha256": "aa"},
+            {"filename": "b.txt", "size": 2, "sha256": "bb"},
+        ])
+        rows = catalog_mod.get_peer_files("peer-x")
+        assert len(rows) == 2
+        names = {r["filename"] for r in rows}
+        assert names == {"a.txt", "b.txt"}
+        for r in rows:
+            assert "peer_name" in r and "sha256" in r and "size" in r
+
 
 class TestGetExpectedHash:
     def setup_method(self):
@@ -90,8 +87,6 @@ class TestGetExpectedHash:
         ])
         assert catalog_mod.get_expected_hash("peer-d", "nohash.bin") is None
 
-
-# ── catalog.find_alternate_peers ─────────────────────────────────────────────
 
 class TestFindAlternatePeers:
     def setup_method(self):
@@ -154,8 +149,6 @@ class TestFindAlternatePeers:
         )
         assert candidates == []
 
-
-# ── Hash integrity in encrypted file reception ────────────────────────────────
 
 class TestHashIntegrityInFileReceive:
     """
