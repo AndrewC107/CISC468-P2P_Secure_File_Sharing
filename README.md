@@ -13,7 +13,7 @@ Paths like `identity/`, `contacts/`, and `storage/` are created **relative to th
 
 `main.py` lives in the **repository root**, so from `alice-peer` or `bob-peer` you run **`../main.py`**, not `main.py` in that folder.
 
-Use **'Single peer'** whenever you are using multiple devices. If you want to test over a single device, then follow the **'Alice'** or **'Bob'** commands.
+Run from the **repository root** for a single peer (or one peer per machine). Use the **Alice** / **Bob** blocks below to run **two peers on one PC** with separate data directories.
 
 ### Python
 

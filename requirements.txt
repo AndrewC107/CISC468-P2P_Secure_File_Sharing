@@ -1,10 +1,4 @@
-# P2P Secure Share - Phase 2
-# Phase 2 adds identity keys and contact authentication.
-
-# Cryptography – Ed25519 key generation, PEM serialisation, SHA-256 fingerprints
-# Used by peer/crypto.py for all key operations.
-# Keys are stored in PKCS#8 / SubjectPublicKeyInfo PEM formats so a future
-# Java client can parse them with java.security.KeyFactory.getInstance("Ed25519").
+# Ed25519 / X25519 / AES-GCM via PEM keys (see peer/crypto.py).
 cryptography>=42.0
 
 # Testing
